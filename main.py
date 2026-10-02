@@ -1240,6 +1240,507 @@ async def native_pan_to_gst(params: Dict[str, Any], request: Request) -> Tuple[O
     return parsed, True
 
 
+# =====================================================================
+# CUSTOM "OWN" AGGREGATORS  (number report + vehicle report)
+# =====================================================================
+GOVT_ID_KEYS = ("document_number", "aadhaar", "uid", "id_number", "govt_id", "id")
+
+
+def phone_variants(query: str) -> List[str]:
+    """Return the phone variants we should try (10 digit, 91-prefixed, ...)."""
+    digits = re.sub(r"\D", "", query or "")
+    variants: List[str] = []
+    if len(digits) == 10:
+        variants = [digits, "91" + digits]
+    elif len(digits) == 12 and digits.startswith("91"):
+        variants = [digits, digits[2:]]
+    elif len(digits) == 11 and digits.startswith("0"):
+        d = digits[1:]
+        variants = [d, "91" + d]
+    elif len(digits) > 12 and digits.startswith("91"):
+        variants = [digits[:12], digits[-10:]]
+    else:
+        variants = [digits] if digits else []
+    seen, out = set(), []
+    for v in variants:
+        if v and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def _clean_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _norm_records(payload: Any) -> List[Dict[str, Any]]:
+    """Pull the flat record list out of the different upstream shapes."""
+    out: List[Dict[str, Any]] = []
+    if not isinstance(payload, dict):
+        return out
+    data = payload.get("data")
+    if isinstance(data, dict):
+        for key in ("main_records", "alternative_records", "records", "results"):
+            if isinstance(data.get(key), list):
+                out.extend([r for r in data[key] if isinstance(r, dict)])
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                if isinstance(item.get("records"), list):
+                    out.extend([r for r in item["records"] if isinstance(r, dict)])
+                else:
+                    out.append(item)
+    return out
+
+
+def _person_from_record(rec: Dict[str, Any], source: str) -> Dict[str, Any]:
+    phones = []
+    for key in ("phone", "mobile", "alt_phone", "phone_number", "number"):
+        val = _clean_text(rec.get(key))
+        if val:
+            for piece in re.split(r"[,\s/]+", val):
+                piece = re.sub(r"\D", "", piece)
+                if 8 <= len(piece) <= 15 and piece not in phones:
+                    phones.append(piece)
+    govt_ids = []
+    for key in GOVT_ID_KEYS:
+        val = _clean_text(rec.get(key))
+        if val and val.lower() not in ("na", "none", "null", "0"):
+            for piece in re.split(r"[,\s/]+", val):
+                piece = re.sub(r"\D", "", piece)
+                if 6 <= len(piece) <= 20 and piece not in govt_ids:
+                    govt_ids.append(piece)
+    return {
+        "name": _title_name(rec.get("full_name") or rec.get("name") or ""),
+        "father_name": _title_name(rec.get("the_name_of_the_father") or rec.get("father_name")
+                                   or rec.get("father") or ""),
+        "phones": phones,
+        "region": _clean_text(rec.get("region") or rec.get("circle") or rec.get("operator") or ""),
+        "govt_ids": govt_ids,
+        "emails": [_clean_text(rec.get("email"))] if _clean_text(rec.get("email", "")) else [],
+        "addresses": [_clean_text(rec.get("address"))] if _clean_text(rec.get("address", "")) else [],
+        "sources": [source],
+        "record_count": 1,
+    }
+
+
+def _title_name(value: str) -> str:
+    value = _clean_text(value)
+    if not value:
+        return ""
+    return " ".join(w.capitalize() if w.islower() or w.isupper() else w for w in value.split())
+
+
+def merge_people(records: List[Tuple[Dict[str, Any], str]], query_phone: str = "") -> List[Dict[str, Any]]:
+    """Group flat records into one card per person (name + father)."""
+    people: List[Dict[str, Any]] = []
+    index: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for rec, source in records:
+        person = _person_from_record(rec, source)
+        if not person["name"] and not person["phones"] and not person["addresses"]:
+            continue
+        key = (person["name"].lower(), person["father_name"].lower())
+        if key in index:
+            cur = index[key]
+            cur["record_count"] += 1
+            for ph in person["phones"]:
+                if ph not in cur["phones"]:
+                    cur["phones"].append(ph)
+            for gid in person["govt_ids"]:
+                if gid not in cur["govt_ids"]:
+                    cur["govt_ids"].append(gid)
+            for em in person["emails"]:
+                if em not in cur["emails"]:
+                    cur["emails"].append(em)
+            for ad in person["addresses"]:
+                if ad and ad not in cur["addresses"]:
+                    cur["addresses"].append(ad)
+            if person["region"] and person["region"] not in cur["regions_raw"]:
+                cur["regions_raw"].append(person["region"])
+            if source not in cur["sources"]:
+                cur["sources"].append(source)
+        else:
+            person["regions_raw"] = [person["region"]] if person["region"] else []
+            people.append(person)
+            index[key] = person
+    # polish region list (unique tokens, split on ';')
+    for p in people:
+        tokens: List[str] = []
+        for raw in p.pop("regions_raw", []):
+            for tok in re.split(r"[;,|]+", raw):
+                tok = _clean_text(tok)
+                if tok and tok not in tokens:
+                    tokens.append(tok)
+        p["regions"] = tokens
+        p["region"] = "; ".join(tokens[:6])
+        # query number first if present
+        qd = re.sub(r"\D", "", query_phone or "")
+        if qd:
+            p["phones"] = [qd] + [ph for ph in p["phones"] if ph != qd]
+        p["alt_phones"] = p["phones"][1:]
+    return people
+
+
+def format_number_report(query: str, people: List[Dict[str, Any]], sources: List[str],
+                         query_variants: List[str]) -> str:
+    sep = "────────────────────────"
+    bar = "━━━━━━━━━━━━━━━━━━━━━━"
+    lines = [f"🔍 NUMBER REPORT — {query}", bar]
+    if not people:
+        lines += ["❌ No record found for this number.", "",
+                  f"🔎 Tried: {', '.join(query_variants)}" if query_variants else "",
+                  sep,
+                  f"📶 Live data · {', '.join(sources) or 'none'} · {now_ist('%d-%m-%Y %H:%M')}"]
+        return "\n".join([l for l in lines if l != ""])
+    for idx, p in enumerate(people):
+        if idx:
+            lines.append(sep)
+        lines.append(f"👤 Name: {p['name'] or 'NA'}")
+        lines.append(f"👨 Father: {p['father_name'] or 'NA'}")
+        lines.append("📱 Phones/Alt: " + (", ".join(p["phones"]) if p["phones"] else "NA"))
+        lines.append(f"🌐 Region: {p['region'] or 'NA'}")
+        if p["govt_ids"]:
+            lines.append("🆔 Govt ID: " + ", ".join(p["govt_ids"]))
+        if p["emails"]:
+            lines.append("📧 Email: " + ", ".join(p["emails"]))
+        if p["addresses"]:
+            lines.append("🏠 Address(es):")
+            for addr in p["addresses"][:6]:
+                lines.append(f"   └ {addr}")
+    lines += [sep,
+              f"📶 Live data · {', '.join(sources)} · {now_ist('%d-%m-%Y %H:%M')}",
+              "Verify from a second source before trusting any personal data."]
+    return "\n".join(lines)
+
+
+def _money(value: Any) -> str:
+    try:
+        num = int(float(str(value).replace(",", "").strip()))
+    except Exception:
+        return f"₹{value}" if value else "₹0"
+    return f"₹{num:,}"
+
+
+def format_vehicle_report(report: Dict[str, Any], sources: List[str]) -> str:
+    bar = "━━━━━━━━━━━━━━━━━━━━━━"
+    v = report.get("vehicle") or {}
+    o = report.get("owner") or {}
+    rto = report.get("rto") or {}
+    rc = report.get("rc") or {}
+    ins = report.get("insurance") or {}
+    puc = report.get("puc") or {}
+    ch = report.get("challans") or {}
+    number = report.get("number", "")
+    lines = [f"🚘 VEHICLE REPORT — {number}", bar]
+    if v.get("maker_model") or v.get("maker"):
+        lines.append("🚗 VEHICLE")
+        lines.append(f"• Maker / Model: {v.get('maker_model') or v.get('maker')}")
+        if v.get("vehicle_class"):
+            lines.append(f"• Class: {v['vehicle_class']}")
+        fuel_line = v.get("fuel") or "NA"
+        if v.get("cubic_capacity"):
+            fuel_line += f" • {str(v['cubic_capacity']).replace(' CC', ' cc').replace(' CC', ' cc')}"
+        lines.append(f"• Fuel: {fuel_line}")
+        if v.get("seating_capacity"):
+            lines.append(f"• Seating: {v['seating_capacity']}")
+        if v.get("fuel_norms"):
+            lines.append(f"• Emission: {v['fuel_norms']}")
+        lines.append(bar)
+    if o or rto:
+        lines.append("👤 OWNER & RTO")
+        lines.append(f"• Owner: {o.get('owner_name') or 'NA'}")
+        rto_line = " · ".join([x for x in [rto.get("registered_rto"), rto.get("city_name")] if x])
+        lines.append(f"• RTO: {rto_line or 'NA'}")
+        lines.append(f"• RTO Phone: {rto.get('phone') or 'NA'}")
+        lines.append(f"• RTO Site: {rto.get('website') or 'NA'}")
+        lines.append(bar)
+    if rc:
+        lines.append("📅 RC / PAPERS")
+        lines.append(f"• Registration: {rc.get('registration_date') or 'NA'}")
+        lines.append(f"• Fitness upto: {rc.get('fitness_upto') or 'NA'}")
+        lines.append(f"• Tax upto: {rc.get('tax_upto') or 'NA'}")
+        if rc.get("vehicle_age"):
+            lines.append(f"• Vehicle Age: {rc['vehicle_age']}")
+        financer = (o.get("financer") or "NA")
+        lines.append(f"• Finance: {financer}"
+                     + (" (no hypothecation)" if str(financer).upper() == "NA" else ""))
+        lines.append(bar)
+    if ins or puc:
+        lines.append("🛡️ INSURANCE & PUC")
+        lines.append(f"• Insurance: {ins.get('company') or 'NA'}")
+        valid = ins.get("expiry") or "NA"
+        if ins.get("validity"):
+            valid += f" ({ins['validity']})"
+        lines.append(f"• Valid upto: {valid}")
+        lines.append(f"• Status: {ins.get('status') or 'NA'}")
+        puc_line = puc.get("upto") or "NA"
+        if puc.get("status"):
+            puc_line += f" ({puc['status']})"
+        lines.append(f"• PUC: {puc_line}")
+        lines.append(bar)
+    if ch:
+        total = ch.get("count") or 0
+        lines.append(f"🚨 CHALLANS — {total} found")
+        lines.append(f"• ⏳ Pending: {ch.get('pending_count', 0)} — {_money(ch.get('pending_amount', 0))}")
+        lines.append(f"• 💰 Total amount (all challans): {_money(ch.get('total_amount', 0))}")
+        for c in ch.get("list", [])[:10]:
+            lines.append("")
+            lines.append(f"🔹 #{c.get('challan_number') or 'NA'}")
+            lines.append(f"   👤 Accused: {c.get('accused_name') or 'NA'}")
+            lines.append(f"   💰 Amount: {_money(c.get('amount', 0))}")
+            lines.append(f"   📅 Date: {c.get('challan_date') or 'NA'}")
+            status = str(c.get("challan_status") or "").upper()
+            lines.append(f"   ❌ Status: {'⏳ PENDING' if 'PEND' in status else ('✅ ' + status if status else 'NA')}")
+            lines.append(f"   🛑 Offence: {c.get('offense_details') or 'NA'}")
+            lines.append(f"   📍 Place: {c.get('challan_place') or 'NA'}")
+        lines.append(bar)
+    lines.append(f"📶 Live data · {', '.join(sources)} · {now_ist('%d-%m-%Y %H:%M')}")
+    lines.append("Confirm once on the official e-Challan / Parivahan site before paying anything.")
+    return "\n".join(lines)
+
+
+async def native_num_info_full(params: Dict[str, Any], request: Request) -> Tuple[Optional[Dict], bool]:
+    """Own number-intelligence API: local DB + num-info + leak-v1/v2, merged & formatted."""
+    started = time.time()
+    raw_query = (params.get("q") or params.get("number") or params.get("phone")
+                 or params.get("num") or params.get("query") or "").strip()
+    if not raw_query:
+        return None, True
+    variants = phone_variants(raw_query)
+    deep = str(params.get("deep", "0")).lower() in ("1", "true", "yes")
+    if not deep:
+        variants = variants[:2]
+
+    collected: List[Tuple[Dict[str, Any], str]] = []
+    sources: List[str] = []
+    raw_payloads: Dict[str, Any] = {}
+    tried: List[str] = []
+
+    # 1) our own database first
+    for variant in variants:
+        for category in ("phone", "leak"):
+            for rec in custom_lookup(category, variant):
+                collected.append((rec, f"own-db:{category}"))
+                if f"own-db:{category}" not in sources:
+                    sources.append(f"own-db:{category}")
+
+    # 2) upstream sources
+    for variant in variants:
+        for source_path in ("num-info", "leak-v1", "leak-v2"):
+            tried.append(f"{source_path}:{variant}")
+            data, _ = await upstream_call(source_path, {"q": variant}, timeout=60, retries=0)
+            if data is None:
+                continue
+            records = _norm_records(data)
+            if records:
+                if source_path not in sources:
+                    sources.append(source_path)
+                if params.get("raw") in ("1", "true", "yes"):
+                    raw_payloads[f"{source_path}:{variant}"] = data
+                for rec in records:
+                    collected.append((rec, source_path))
+        if collected and not deep:
+            break
+
+    people = merge_people(collected, variants[0] if variants else raw_query)
+    elapsed = round(time.time() - started, 2)
+    formatted = format_number_report(raw_query, people, sources or ["no-source"], variants)
+    payload = {
+        "success": bool(people),
+        "query": raw_query,
+        "query_variants": variants,
+        "record_count": len(people),
+        "people": people,
+        "sources_used": sources,
+        "sources_tried": tried if not people else tried[:len(tried)],
+        "response_time": f"{elapsed}s",
+        "timestamp_ist": now_ist("%d-%m-%Y %H:%M:%S"),
+        "indian_time_stamp": f"{now_ist('%Y-%m-%d %I:%M:%S %p')} IST",
+        "formatted": formatted,
+    }
+    if raw_payloads:
+        payload["raw"] = raw_payloads
+    if not people:
+        payload["error"] = "No record found for this number."
+        payload["_no_cache"] = True
+    return payload, not bool(people)
+
+
+async def native_vehicle_report(params: Dict[str, Any], request: Request) -> Tuple[Optional[Dict], bool]:
+    """Own vehicle API: RC + RTO + insurance + PUC + challans, merged & formatted."""
+    started = time.time()
+    number = (params.get("number") or params.get("rc") or params.get("vehicle_number")
+              or params.get("reg") or params.get("q") or "").strip()
+    if not number:
+        return None, True
+    number = re.sub(r"[^A-Za-z0-9]", "", number).upper()
+
+    sources: List[str] = []
+    rc_payload: Optional[Dict[str, Any]] = None
+    info_payload: Optional[Dict[str, Any]] = None
+    challan_payload: Optional[Dict[str, Any]] = None
+    summary_payload: Optional[Dict[str, Any]] = None
+
+    # 1) RC details (main source)
+    rc_payload, _ = await upstream_call("vehicle-rc", {"number": number}, timeout=60, retries=1)
+    if rc_payload is None:
+        for fb in ("vehicle-info", "vehicle-details", "vehicle-v"):
+            rc_payload, _ = await upstream_call(fb, {"number": number, "rc": number,
+                                                     "vehicle_number": number}, timeout=60, retries=0)
+            if rc_payload is not None:
+                sources.append(fb)
+                break
+    else:
+        sources.append("vehicle-rc")
+    if isinstance(rc_payload, dict) and rc_payload.get("errorMsg"):
+        rc_payload = None
+
+    # 2) Extra make/model data
+    if not rc_payload or not (rc_payload.get("data") or {}).get("vehicle_info"):
+        info_payload, _ = await upstream_call("vehicle-info", {"vehicle_number": number},
+                                              timeout=45, retries=0)
+        if isinstance(info_payload, dict) and not info_payload.get("errorMsg"):
+            sources.append("vehicle-info")
+        else:
+            info_payload = None
+
+    # 3) Challans (detailed list + summary)
+    challan_payload, _ = await upstream_call("vehicle-challan", {"number": number}, timeout=60, retries=0)
+    if isinstance(challan_payload, dict) and (challan_payload.get("data") or {}).get("challan_details"):
+        sources.append("vehicle-challan")
+    else:
+        challan_payload = None
+    summary_payload, _ = await upstream_call("vehicle-challan-v4", {"number": number}, timeout=60, retries=0)
+    if isinstance(summary_payload, dict) and (summary_payload.get("data") or {}).get("challan_summary"):
+        sources.append("vehicle-challan-v4")
+    else:
+        summary_payload = None
+
+    local = parse_vehicle(number)
+    # 4) own database records
+    own = custom_lookup("vehicle", number.lower())
+
+    sections = ((rc_payload or {}).get("data") or {}).get("sections") or {}
+    if not sections and isinstance(rc_payload, dict):
+        sections = rc_payload.get("sections") or {}
+    dates = sections.get("important_dates") or {}
+    ins_raw = sections.get("insurance_information") or {}
+    other = sections.get("other_information") or {}
+    own_sec = sections.get("ownership_details") or {}
+    veh_sec = sections.get("vehicle_details") or {}
+    vinfo = ((rc_payload or {}).get("data") or {}).get("vehicle_info") or {}
+    if not vinfo and isinstance(rc_payload, dict):
+        vinfo = rc_payload.get("vehicle_info") or {}
+
+    maker = veh_sec.get("Model Name") or vinfo.get("model_name") or ""
+    model = veh_sec.get("Maker Model") or vinfo.get("model_name") or ""
+    _mm_parts: List[str] = []
+    for _part in (maker, model):
+        if _part and _part not in _mm_parts:
+            _mm_parts.append(_part)
+    maker_model = " ".join(_mm_parts)
+
+    info_data = ((info_payload or {}).get("data") or {})
+    info_owner = info_data.get("owner") if isinstance(info_data.get("owner"), dict) else {}
+    owner = {
+        "owner_name": (own_sec.get("Owner Name") or vinfo.get("owner_name")
+                       or info_owner.get("name") or "NA"),
+        "financer": other.get("Financer Name") or "NA",
+        "blacklist_status": other.get("Blacklist Status") or "NA",
+        "noc": other.get("NOC Details") or "NA",
+        "permit_type": other.get("Permit Type") or "NA",
+    }
+    rto = {
+        "registered_rto": own_sec.get("Registered RTO") or local.get("rto_office") or "NA",
+        "code": vinfo.get("code") or local.get("rto_code") or "NA",
+        "city_name": vinfo.get("city_name") or local.get("rto_office") or "NA",
+        "address": vinfo.get("address") or "NA",
+        "phone": vinfo.get("phone") or "NA",
+        "website": vinfo.get("website") or "NA",
+        "state": local.get("state"),
+    }
+    rc = {
+        "registration_number": own_sec.get("Registration Number") or number,
+        "registration_date": dates.get("Registration Date") or "NA",
+        "fitness_upto": dates.get("Fitness Upto") or "NA",
+        "tax_upto": dates.get("Tax Upto") or "NA",
+        "insurance_upto": dates.get("Insurance Upto") or "NA",
+        "vehicle_age": dates.get("Vehicle Age") or "NA",
+        "insurance_expiry_in": dates.get("Insurance Expiry In") or "NA",
+    }
+    insurance = {
+        "company": ins_raw.get("Insurance Company") or "NA",
+        "expiry": ins_raw.get("Insurance Expiry") or dates.get("Insurance Upto") or "NA",
+        "status": ins_raw.get("Insurance Status") or "NA",
+        "validity": ins_raw.get("Insurance Validity") or "NA",
+    }
+    puc = {
+        "upto": dates.get("PUC Upto") or "NA",
+        "status": dates.get("PUC Expiry In") or "NA",
+    }
+
+    challan_details = []
+    if challan_payload:
+        challan_details = ((challan_payload.get("data") or {}).get("challan_details") or [])
+    summary = ((summary_payload or {}).get("data") or {}).get("challan_summary") or {}
+    pending_amount, total_amount, pending_count = 0, 0, 0
+    for c in challan_details:
+        try:
+            amt = int(float(str(c.get("amount", 0)).replace(",", "") or 0))
+        except Exception:
+            amt = 0
+        total_amount += amt
+        if "pend" in str(c.get("challan_status", "")).lower():
+            pending_amount += amt
+            pending_count += 1
+    if summary:
+        total_amount = summary.get("total_amount", total_amount)
+        pending_amount = ((summary.get("type_a") or {}).get("amount", pending_amount))
+        pending_count = ((summary.get("type_a") or {}).get("count", pending_count))
+
+    report = {
+        "number": number,
+        "vehicle": {
+            "maker": maker or "NA", "model": model or "NA", "maker_model": maker_model or "NA",
+            "vehicle_class": veh_sec.get("Vehicle Class") or "NA",
+            "fuel": veh_sec.get("Fuel Type") or "NA",
+            "cubic_capacity": other.get("Cubic Capacity") or "NA",
+            "seating_capacity": other.get("Seating Capacity") or "NA",
+            "fuel_norms": veh_sec.get("Fuel Norms") or "NA",
+            "vertical": (info_payload or {}).get("vertical") or local.get("vertical_guess"),
+        },
+        "owner": owner,
+        "rto": rto,
+        "rc": rc,
+        "insurance": insurance,
+        "puc": puc,
+        "challans": {
+            "count": summary.get("total_challans", len(challan_details)),
+            "pending_count": pending_count,
+            "pending_amount": pending_amount,
+            "total_amount": total_amount,
+            "disposed_count": ((summary.get("type_b") or {}).get("count", 0)),
+            "list": challan_details,
+        },
+        "local_analysis": local,
+        "custom_database_records": own,
+        "sources_used": sources,
+        "response_time": f"{round(time.time() - started, 2)}s",
+        "timestamp_ist": now_ist("%d-%m-%Y %H:%M:%S"),
+    }
+    if not sources and not own:
+        report["success"] = False
+        report["error"] = ("Vehicle data not available right now (upstream sources down). "
+                           "Offline RTO parsing is included under local_analysis.")
+        report["formatted"] = format_vehicle_report(report, sources or ["offline-parse"])
+        report["_no_cache"] = True
+        return report, True
+
+    report["success"] = True
+    report["formatted"] = format_vehicle_report(report, sources)
+    return report, False
+
+
 NATIVE_FUNCS: Dict[str, Callable[..., Awaitable[Tuple[Optional[Dict], bool]]]] = {
     "ip_v1": native_ip_v1,
     "ip_v2": native_ip_v2,
@@ -1259,6 +1760,8 @@ NATIVE_FUNCS: Dict[str, Callable[..., Awaitable[Tuple[Optional[Dict], bool]]]] =
     "gst_search": native_gst_search,
     "pan": native_pan,
     "pan_to_gst": native_pan_to_gst,
+    "num_info_full": native_num_info_full,
+    "vehicle_report": native_vehicle_report,
 }
 for _kind in ("challan", "challan-v2", "challan-v4", "info", "info-v2", "rc", "details", "v"):
     NATIVE_FUNCS[f"vehicle_{_kind.replace('-', '_')}"] = None  # filled after loop (await below)
@@ -1399,9 +1902,20 @@ ENDPOINTS: List[Dict[str, Any]] = [
     dict(path="leak-v2", name="Leak OSINT V2", icon="🔥", category="Leak OSINT", native="leak",
          mode="upstream", params=[P("q", "919973700987")], db_category="leak",
          desc="Leak OSINT search, version 2."),
-    dict(path="num-info", name="Number Info", icon="📞", category="Leak OSINT", native="num_info",
-         mode="upstream", params=[P("q", "919973700984")], db_category="phone",
-         desc="Phone number intelligence + local number validation."),
+    dict(path="num-info", name="Number Info (Full Report)", icon="📞", category="Leak OSINT",
+         native="num_info_full", mode="native", timeout=70,
+         params=[P("q", "919973700984")],
+         desc="⭐ Own number API: name, father, all phone/alt numbers, region, govt ID, addresses "
+              "(own DB + num-info + leak-v1/v2, merged). Add &format=text for the card message, "
+              "&deep=1 to try more number variants, &raw=1 for raw upstream payloads."),
+    dict(path="number-info", name="Number Info (alias)", icon="📞", category="Leak OSINT",
+         native="num_info_full", mode="native", timeout=70,
+         params=[P("q", "9058390341")],
+         desc="Same as /api/num-info (alias for older bots)."),
+    dict(path="num", name="Number (short alias)", icon="☎️", category="Leak OSINT",
+         native="num_info_full", mode="native", timeout=70,
+         params=[P("q", "9058390341")],
+         desc="Short alias of /api/num-info."),
 
     # ---------- GST / PAN ----------
     dict(path="gst-search", name="GST Search", icon="🧮", category="GST / PAN", native="gst_search",
@@ -1431,6 +1945,21 @@ ENDPOINTS: List[Dict[str, Any]] = [
     dict(path="pan-info", name="PAN Info", icon="🪪", category="GST / PAN", native="pan",
          mode="merge_native", params=[P("pan", "AAYFK4129N")], db_category="pan",
          desc="PAN validation, holder type and linked details."),
+
+    # ---------- Own report APIs (aggregated) ----------
+    dict(path="vehicle-report", name="Vehicle Report (RC + Challan)", icon="🚘", category="Vehicle",
+         native="vehicle_report", mode="native", timeout=90,
+         params=[P("number", "BR30AR0802")],
+         desc="⭐ Own vehicle API by number plate: maker/model, class, fuel, owner, RTO, RC dates, "
+              "insurance, PUC and full challan list. Add &format=text for the ready-to-share card."),
+    dict(path="vehicle-full", name="Vehicle Report (alias)", icon="🚘", category="Vehicle",
+         native="vehicle_report", mode="native", timeout=90,
+         params=[P("number", "MH12DE1433")],
+         desc="Alias of /api/vehicle-report."),
+    dict(path="rc-info", name="RC Info (alias)", icon="📄", category="Vehicle",
+         native="vehicle_report", mode="native", timeout=90,
+         params=[P("rc", "BR30AR0802")],
+         desc="RC details by registration number (alias of /api/vehicle-report)."),
 ]
 
 ENDPOINT_MAP = {e["path"]: e for e in ENDPOINTS}
@@ -1527,7 +2056,8 @@ def error_payload(ep: Dict[str, Any], message: str, hint: Optional[str] = None) 
 
 async def run_endpoint(request: Request, ep: Dict[str, Any]) -> JSONResponse:
     started = time.time()
-    params = {k: v for k, v in request.query_params.items() if k not in ("key", "nocache", "_")}
+    params = {k: v for k, v in request.query_params.items()
+              if k not in ("key", "nocache", "_", "format")}
     api_key = request.query_params.get("key", DEMO_KEY)
 
     # --- api key ---
@@ -1662,8 +2192,16 @@ async def run_endpoint(request: Request, ep: Dict[str, Any]) -> JSONResponse:
 
     payload = mark(payload, source, ep)
     ms = int((time.time() - started) * 1000)
+
+    # ?format=text -> ready to share card (Telegram / WhatsApp friendly)
+    fmt = (request.query_params.get("format") or "").lower()
+    if fmt in ("text", "txt", "card", "plain") and isinstance(payload, dict) and payload.get("formatted"):
+        log_request(ep["path"], key_used, params, source + "+text", 200, ms, client_ip(request))
+        return PlainTextResponse(payload["formatted"])
+
     log_request(ep["path"], key_used, params, source, 200, ms, client_ip(request))
-    if get_setting("cache_enabled", "1") == "1" and ttl:
+    skip_cache = isinstance(payload, dict) and payload.pop("_no_cache", False)
+    if get_setting("cache_enabled", "1") == "1" and ttl and not skip_cache:
         cache_set(cache_key, ep["path"], payload)
     return JSONResponse(payload, headers={"X-Source": source, "X-Response-Time": f"{ms}ms"})
 

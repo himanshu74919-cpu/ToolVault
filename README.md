@@ -1,9 +1,9 @@
-# 🛰️ OSINT & Multi-Utility API Hub (43 Endpoints + SQLite Database + Dashboard)
+# 🛰️ OSINT & Multi-Utility API Hub (48 Endpoints + SQLite Database + Dashboard)
 
 Ye ek **ready-to-use API Hub** hai jo `https://osint-apis-hub.onrender.com` jaisi hi endpoint
 structure follow karta hai, lekin isme extra milta hai:
 
-* ✅ **43 endpoints** – `?key=Demo` ya aapki khud ki API key se
+* ✅ **48 endpoints** – `?key=Demo` ya aapki khud ki API key se
 * ✅ **SQLite database** – apna khud ka data (leak records, phone, GST, PAN, vehicle…) dashboard se add karein
 * ✅ **Web Dashboard** (`/dashboard`) – tablet/mobile friendly, bina coding ke sab kuch control
 * ✅ **Smart fallback** – har endpoint pehle free native source try karta hai, agar poori data
@@ -12,6 +12,134 @@ structure follow karta hai, lekin isme extra milta hai:
 * ✅ **Response caching** – same query dobara aane par turant result (SQLite cache)
 * ✅ **API key management** – naye keys banao, disable karo, usage dekho
 * ✅ **Free cloud hosting** – Render / Railway / Koyeb / Docker, kahin bhi
+
+---
+
+# ⭐ 2 KHAAS APIs (aapke liye banayi gayi)
+
+## 1️⃣ `/api/num-info` — Full Number Report
+
+**Request:**
+```
+GET /api/num-info?key=Demo&q=9058390341
+GET /api/num-info?key=Demo&q=919058390341&format=text   ← Telegram/WhatsApp ke liye card
+```
+
+Number 10-digit ho ya `91` ke saath — dono chalega (API khud dono variant try karta hai).
+Extra params: `&deep=1` (aur number variants try kare), `&raw=1` (raw upstream data bhi).
+
+**`&format=text` output (bilkul waise hi):**
+```
+🔍 NUMBER REPORT — 9058390341
+━━━━━━━━━━━━━━━━━━━━━━
+👤 Name: Brajesh Kumar
+👨 Father: Rabendra Singh
+📱 Phones/Alt: 9058390341, 916395131687
+🌐 Region: JIO UPE UPW; AIRTEL UPW; JIO UPW
+🆔 Govt ID: 861313813129
+🏠 Address(es):
+   └ S/O Rabendra Singh,puraiya,JOGAAMainpuri,Uttar Pradesh,206301
+────────────────────────
+📶 Live data · num-info, leak-v1 · 02-10-2026 22:03
+```
+
+**JSON output:**
+```json
+{
+  "success": true,
+  "query": "9058390341",
+  "record_count": 1,
+  "people": [
+    {
+      "name": "Brajesh Kumar",
+      "father_name": "Rabendra Singh",
+      "phones": ["9058390341", "916395131687"],
+      "alt_phones": ["916395131687"],
+      "region": "JIO UPE UPW; AIRTEL UPW; JIO UPW",
+      "govt_ids": ["861313813129"],
+      "emails": [],
+      "addresses": ["S/O Rabendra Singh,puraiya,JOGAAMainpuri,Uttar Pradesh,206301"],
+      "sources": ["num-info"]
+    }
+  ],
+  "sources_used": ["num-info", "leak-v1"],
+  "formatted": "🔍 NUMBER REPORT — ...",
+  "timestamp_ist": "02-10-2026 22:03:41"
+}
+```
+
+**Data kahan se aata hai (priority order):**
+1. 🗄️ **Aapka apna database** (Dashboard → Database → category `phone` / `leak`)
+2. 🌐 `num-info` source
+3. 🌐 `leak-v1` / `leak-v2` sources
+
+Sab sources ke records **ek saath merge** hote hain — ek hi insaan ke multiple phone numbers,
+govt IDs aur addresses ek card me aa jate hain.
+
+---
+
+## 2️⃣ `/api/vehicle-report` — RC + Challan Full Report
+
+**Request:**
+```
+GET /api/vehicle-report?key=Demo&number=BR30AR0802
+GET /api/vehicle-report?key=Demo&number=BR30AR0802&format=text   ← ready to share card
+```
+Aliases: `/api/vehicle-full?number=...`, `/api/rc-info?rc=...`
+
+**`&format=text` output:**
+```
+🚘 VEHICLE REPORT — BR30AR0802
+━━━━━━━━━━━━━━━━━━━━━━
+🚗 VEHICLE
+• Maker / Model: HONDA SHINE
+• Class: M-CYCLE/SCOOTER
+• Fuel: PETROL • 124.6 cc
+• Seating: 2
+• Emission: BHARAT STAGE VI
+━━━━━━━━━━━━━━━━━━━━━━
+👤 OWNER & RTO
+• Owner: S*****U S*H
+• RTO: SITAMARHI, BIHAR · Sitamarhi
+• RTO Phone: NA
+• RTO Site: https://state.bihar.gov.in/transport/CitizenHome.html
+━━━━━━━━━━━━━━━━━━━━━━
+📅 RC / PAPERS
+• Registration: 29-Aug-2025
+• Fitness upto: 28-Aug-2040
+• Tax upto: LTT
+• Vehicle Age: 1 years , 1 months & 3 days
+• Finance: NA (no hypothecation)
+━━━━━━━━━━━━━━━━━━━━━━
+🛡️ INSURANCE & PUC
+• Insurance: GO DIGIT GENERAL INSURANCE LTD
+• Valid upto: 27-Jul-2030 (Insurance Valid Upto 3 years , 9 months & 25 days)
+• Status: You Are Insured
+• PUC: 28-Aug-2026 (PUC Already Expired)
+━━━━━━━━━━━━━━━━━━━━━━
+🚨 CHALLANS — 1 found
+• ⏳ Pending: 1 — ₹1,000
+• 💰 Total amount (all challans): ₹1,000
+
+🔹 #BR250023260716183506
+   👤 Accused: R****T K***R
+   💰 Amount: ₹1,000
+   📅 Date: 16-07-2026
+   ❌ Status: ⏳ PENDING
+   🛑 Offence: Driving without helmet
+   📍 Place: HFXW+W8F Narayan sah chowk, Vidya Pati Nagar, Bhabdepur, Sitamarhi, Bihar 843302, India
+━━━━━━━━━━━━━━━━━━━━━━
+📶 Live data · vehicle-rc, vehicle-challan, vehicle-challan-v4 · 02-10-2026 22:03
+Confirm once on the official e-Challan / Parivahan site before paying anything.
+```
+
+**JSON sections:** `vehicle`, `owner`, `rto`, `rc`, `insurance`, `puc`,
+`challans{count, pending_count, pending_amount, total_amount, list[]}`,
+`local_analysis` (offline RTO decode), `custom_database_records` (aapka data).
+
+**Data sources (auto fallback):** `vehicle-rc` → `vehicle-info` / `vehicle-details` / `vehicle-v`
++ challan list `vehicle-challan` + challan summary `vehicle-challan-v4`.
+Koi source down ho to report bina us section ke bhi banti hai — kabhi pura fail nahi hota.
 
 ---
 
@@ -64,7 +192,7 @@ Agar aapko `Demo` key band karni ho to: **Settings → Demo key enabled → No �
 
 ---
 
-## 📋 Pure 43 Endpoints (Base URL ke saath)
+## 📋 Pure 48 Endpoints (Base URL ke saath)
 
 Base URL example: `https://aapka-url.onrender.com` (ya local me `http://localhost:8000`)
 
@@ -143,6 +271,17 @@ Base URL example: `https://aapka-url.onrender.com` (ya local me `http://localhos
 | 42 | `/api/pan-to-gst-v4` | `?key=Demo&pan=AAYFK4129N` |
 | 43 | `/api/pan-info` | `?key=Demo&pan=AAYFK4129N` |
 
+### ⭐ Aapke khaas report APIs
+| # | Endpoint | Example |
+|---|----------|---------|
+| 44 | `/api/vehicle-report` | `?key=Demo&number=BR30AR0802` (RC + RTO + insurance + PUC + challans) |
+| 45 | `/api/vehicle-full` | `?key=Demo&number=MH12DE1433` (alias) |
+| 46 | `/api/rc-info` | `?key=Demo&rc=BR30AR0802` (alias) |
+| 47 | `/api/number-info` | `?key=Demo&q=9058390341` (alias of num-info) |
+| 48 | `/api/num` | `?key=Demo&q=9058390341` (short alias) |
+
+(`/api/num-info` upar #34 me hai — wo ab full merged report deta hai.)
+
 ### ➕ Extra helper endpoints (bonus)
 | Endpoint | Kaam |
 |----------|------|
@@ -180,7 +319,7 @@ Ab jab koi `/api/num-info?key=Demo&q=919973700984` chalega, to response me
 
 | Tab | Kya milta hai |
 |-----|---------------|
-| 🔌 Endpoints | 43 endpoints ki list, search, category filter, live test + response + Copy URL |
+| 🔌 Endpoints | 48 endpoints ki list, search, category filter, live test + response + Copy URL |
 | 🗄️ Database | Records add / search / delete / CSV import / export |
 | 🔑 API Keys | Naya key banao, enable-disable karo, request count dekho |
 | 📊 Logs | Kaunsi API kab chali, source (native/upstream/cache), time, status |
