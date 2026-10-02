@@ -2318,6 +2318,160 @@ async def native_aadhaar_family(params: Dict[str, Any], request: Request) -> Tup
 # ---------------------------------------------------------------------
 # YOUTUBE DOWNLOADER (for Telegram bots)
 # ---------------------------------------------------------------------
+# Public YouTube front-end APIs — datacenter IP (Render) par yt-dlp block ho jata hai,
+# tab ye fallback direct streaming links de dete hain.
+PIPED_INSTANCES = [
+    "https://pipedapi.kavin.rocks",
+    "https://pipedapi.adminforge.de",
+    "https://api.piped.private.coffee",
+    "https://pipedapi.reallyaweso.me",
+    "https://pipedapi.drgns.space",
+]
+INVIDIOUS_INSTANCES = [
+    "https://invidious.f5.si",
+    "https://yewtu.be",
+    "https://inv.nadeko.net",
+    "https://invidious.nerdvpn.de",
+    "https://inv.vern.cc",
+    "https://invidious.privacyredirect.com",
+]
+
+_INVIDIOUS_CACHE = {"at": 0.0, "list": []}
+
+
+def _invidious_instance_list() -> List[str]:
+    """Public Invidious instance list (30 min cache) + hardcoded backup."""
+    import httpx
+
+    if time.time() - _INVIDIOUS_CACHE["at"] < 1800 and _INVIDIOUS_CACHE["list"]:
+        return _INVIDIOUS_CACHE["list"]
+    found: List[str] = []
+    try:
+        r = httpx.get("https://api.invidious.io/instances.json", timeout=5,
+                      follow_redirects=True)
+        if r.status_code == 200:
+            for _name, meta in (r.json() or {}):
+                uri = str((meta or {}).get("uri") or "").rstrip("/")
+                if (meta or {}).get("api") and uri.startswith("https://"):
+                    found.append(uri)
+    except Exception:  # noqa: BLE001
+        pass
+    ordered: List[str] = []
+    for u in found + INVIDIOUS_INSTANCES:
+        if u not in ordered:
+            ordered.append(u)
+    _INVIDIOUS_CACHE.update({"at": time.time(), "list": ordered})
+    return ordered
+
+
+def _piped_streams(vid: str, mode: str, quality: str, tries: int = 3,
+                   per_timeout: float = 8.0) -> Dict[str, Any]:
+    """Piped API se direct video/audio links (blocking, thread me chalega)."""
+    import httpx
+
+    tried: List[str] = []
+    for base in PIPED_INSTANCES[:tries]:
+        tried.append(base)
+        try:
+            r = httpx.get(f"{base}/streams/{vid}", timeout=per_timeout,
+                          headers={"User-Agent": "Mozilla/5.0"},
+                          follow_redirects=True)
+            if r.status_code != 200:
+                continue
+            d = r.json()
+            links: List[Dict[str, Any]] = []
+            if mode in ("video", "both"):
+                for s in (d.get("videoStreams") or [])[:6]:
+                    if s.get("url"):
+                        links.append({"type": "video", "provider": "piped",
+                                      "quality": s.get("quality") or "",
+                                      "ext": (s.get("mimeType") or "").split("/")[-1] or "mp4",
+                                      "url": s.get("url")})
+            if mode in ("audio", "both") or not links:
+                for s in (d.get("audioStreams") or [])[:4]:
+                    if s.get("url"):
+                        links.append({"type": "audio", "provider": "piped",
+                                      "quality": f"{s.get('bitrate') or ''}kbps".replace("kbpskbps", "kbps"),
+                                      "ext": (s.get("mimeType") or "").split("/")[-1] or "m4a",
+                                      "url": s.get("url")})
+            if links:
+                if quality and quality.isdigit():
+                    vids = [l for l in links if l["type"] == "video"]
+                    if vids:
+                        try:
+                            want = int(quality)
+                            vids.sort(key=lambda l: abs(int(str(l["quality"]).replace("p", "") or 0) - want)
+                                      if str(l["quality"]).replace("p", "").isdigit() else 9999)
+                            best = vids[0]
+                            links = [best] + [l for l in links if l["type"] == "audio"][:1]
+                        except Exception:  # noqa: BLE001
+                            pass
+                return {"video_id": vid, "title": d.get("title"),
+                        "channel": d.get("uploader"),
+                        "duration": d.get("duration"),
+                        "thumbnail": d.get("thumbnail"),
+                        "links": links, "provider": "piped", "tried": tried}
+        except Exception:  # noqa: BLE001
+            continue
+    return {"links": [], "tried": tried}
+
+
+def _invidious_streams(vid: str, mode: str, tries: int = 3,
+                       per_timeout: float = 8.0) -> Dict[str, Any]:
+    """Invidious API se direct links (blocking fallback)."""
+    import httpx
+
+    tried: List[str] = []
+    for base in _invidious_instance_list()[:tries]:
+        tried.append(base)
+        try:
+            r = httpx.get(f"{base}/api/v1/videos/{vid}", timeout=per_timeout,
+                          headers={"User-Agent": "Mozilla/5.0"}, follow_redirects=True)
+            if r.status_code != 200:
+                continue
+            d = r.json()
+            links: List[Dict[str, Any]] = []
+            fmts = (d.get("adaptiveFormats") or []) + (d.get("formatStreams") or [])
+            for s in fmts:
+                u = s.get("url")
+                if not u:
+                    continue
+                t = (s.get("type") or "")
+                is_audio = "audio" in t
+                if mode == "audio" and not is_audio:
+                    continue
+                if mode == "video" and is_audio and not any(l["type"] == "video" for l in links):
+                    links.append({"type": "audio", "provider": "invidious",
+                                  "quality": f"{s.get('bitrate') or ''}kbps",
+                                  "ext": s.get("container") or ("m4a" if is_audio else "mp4"),
+                                  "url": u})
+                    continue
+                if is_audio:
+                    links.append({"type": "audio", "provider": "invidious",
+                                  "quality": f"{s.get('bitrate') or ''}kbps",
+                                  "ext": s.get("container") or "m4a", "url": u})
+                else:
+                    links.append({"type": "video", "provider": "invidious",
+                                  "quality": s.get("qualityLabel") or s.get("quality") or "",
+                                  "ext": s.get("container") or "mp4", "url": u})
+            if links:
+                vids = [l for l in links if l["type"] == "video"]
+                if mode != "audio" and vids:
+                    vids.sort(key=lambda l: (str(l["quality"]).replace("p", "").isdigit()
+                                             and -int(str(l["quality"]).replace("p", "")) or 0))
+                    keep = vids[:1] + [l for l in links if l["type"] == "audio"][:1]
+                    links = keep
+                else:
+                    links = [l for l in links if l["type"] == "audio"][:1] or links[:1]
+                return {"video_id": vid, "title": d.get("title"),
+                        "channel": d.get("author"), "duration": d.get("lengthSeconds"),
+                        "thumbnail": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
+                        "links": links, "provider": "invidious", "tried": tried}
+        except Exception:  # noqa: BLE001
+            continue
+    return {"links": [], "tried": tried}
+
+
 def _yt_extract(url: str, mode: str, quality: str, timeout: int = 40) -> Dict[str, Any]:
     """Blocking yt-dlp extraction (run inside a thread)."""
     try:
@@ -2333,10 +2487,18 @@ def _yt_extract(url: str, mode: str, quality: str, timeout: int = 40) -> Dict[st
     else:
         fmt = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
 
+    # Cloud/datacenter IP se YouTube aksar "Sign in to confirm you're not a bot" deta hai.
+    # Alag-alag player clients try karne se kai baar bypass ho jata hai.
     opts = {
         "quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
         "format": fmt, "socket_timeout": timeout, "nocheckcertificate": True,
         "source_address": None, "geo_bypass": True,
+        "extractor_args": {"youtube": {"player_client": ["tv_embedded", "web_safari", "mweb", "web"]}},
+        "http_headers": {
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"),
+            "Accept-Language": "en-US,en;q=0.9",
+        },
     }
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -2392,21 +2554,61 @@ async def native_youtube_download(params: Dict[str, Any], request: Request) -> T
 
     result: Dict[str, Any] = {}
     error = ""
+    debug: Dict[str, Any] = {}
     deadline = float(get_setting("max_request_seconds", "50") or 50)
+    # Render free plan ~25-30s me request maar deta hai, isliye fallback chain tight rakhi hai
+    hard_deadline = min(deadline, 26.0)
     try:
         loop = __import__("asyncio").get_event_loop()
         result = await loop.run_in_executor(
             None, lambda: _yt_extract(watch, "audio" if mode == "audio" else mode, quality,
-                                      timeout=int(max(20, min(deadline - 5, 40)))))
+                                      timeout=int(max(12, min(hard_deadline * 0.7, 18)))))
     except Exception as exc:
         error = str(exc)[:200]
 
-    # fallback: upstream download links (agar yt-dlp fail ho ya installed na ho)
+    debug["yt_dlp"] = {
+        "links": len(result.get("links") or []) if isinstance(result, dict) else 0,
+        "error": (result.get("error") if isinstance(result, dict) else None) or error or None,
+    }
+
+    # fallback 1: Piped API (datacenter IP par bhi kaam karta hai)
     links = result.get("links") if isinstance(result, dict) else None
     upstream_links: List[Dict[str, Any]] = []
     sources: List[str] = []
-    if not links and (time.time() - started) < deadline * 0.8:
-        up, _ = await upstream_call("youtube-all", {"url": watch}, timeout=30, retries=0)
+    if not links and (time.time() - started) < hard_deadline * 0.75:
+        left = hard_deadline - (time.time() - started)
+        try:
+            piped = await loop.run_in_executor(
+                None, lambda: _piped_streams(vid, "audio" if mode == "audio" else mode, quality,
+                                             tries=3, per_timeout=max(3.0, min(6.0, left / 3))))
+            debug["piped"] = {"links": len(piped.get("links") or []),
+                              "tried": piped.get("tried", [])}
+            if piped.get("links"):
+                result = piped
+                sources.append("piped")
+        except Exception as exc:  # noqa: BLE001
+            debug["piped"] = {"error": str(exc)[:120]}
+
+    # fallback 2: Invidious API
+    if not (result.get("links") if isinstance(result, dict) else None) \
+            and (time.time() - started) < hard_deadline * 0.85:
+        left = hard_deadline - (time.time() - started)
+        try:
+            inv = await loop.run_in_executor(
+                None, lambda: _invidious_streams(vid, "audio" if mode == "audio" else mode,
+                                                 tries=3, per_timeout=max(3.5, min(6.0, left / 3))))
+            debug["invidious"] = {"links": len(inv.get("links") or []),
+                                  "tried": inv.get("tried", [])}
+            if inv.get("links"):
+                result = inv
+                sources.append("invidious")
+        except Exception as exc:  # noqa: BLE001
+            debug["invidious"] = {"error": str(exc)[:120]}
+    if not (result.get("links") if isinstance(result, dict) else None) \
+            and (time.time() - started) < hard_deadline * 0.9:
+        up, _ = await upstream_call("youtube-all", {"url": watch},
+                                    timeout=int(max(8, hard_deadline - (time.time() - started) - 2)),
+                                    retries=0)
         if isinstance(up, dict):
             sources.append("youtube-all")
             dl = up.get("download_links") or {}
@@ -2470,8 +2672,9 @@ async def native_youtube_download(params: Dict[str, Any], request: Request) -> T
         "download_url": (video_link or audio_link or {}).get("url"),
         "audio_url": (audio_link or {}).get("url"),
         "error": error or (result.get("error") if isinstance(result, dict) else None),
-        "sources_used": ["yt-dlp"] if (result.get("links") and not sources) else (sources or ["yt-dlp"]),
+        "sources_used": (sources or ["yt-dlp"]) if result.get("links") else (sources or ["yt-dlp"]),
         "response_time": f"{round(time.time() - started, 2)}s",
+        "debug": debug if str(params.get("debug", "")).lower() in ("1", "true", "yes") else None,
         "timestamp_ist": now_ist("%d-%m-%Y %H:%M:%S"),
         "note": "Direct links expire ho jate hain ~2-6 ghante me; Telegram bot me turant use karein.",
         "formatted": "\n".join(lines),
