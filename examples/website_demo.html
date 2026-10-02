@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OSINT API Demo</title>
+<style>
+  body{background:#0d1117;color:#e6edf3;font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;
+       margin:0;padding:18px;font-size:17px}
+  h1{font-size:22px;margin:0 0 4px}
+  .sub{color:#8b949e;font-size:14px;margin-bottom:16px}
+  input,select,button{font-size:17px;padding:12px;border-radius:10px;border:1px solid #30363d;
+       background:#161b22;color:#e6edf3;width:100%;box-sizing:border-box}
+  button{background:#2f81f7;border:none;font-weight:600;cursor:pointer;margin-top:10px}
+  .card{background:#161b22;border:1px solid #30363d;border-radius:14px;padding:14px;margin-bottom:14px}
+  pre{background:#0d1117;border:1px solid #30363d;border-radius:10px;padding:12px;
+      white-space:pre-wrap;word-break:break-word;font-size:14px;min-height:120px}
+  a{color:#79c0ff}
+  label{font-size:13px;color:#8b949e;display:block;margin:8px 0 4px}
+</style>
+</head>
+<body>
+<h1>🛰️ OSINT API Demo</h1>
+<div class="sub">Apna API Hub kisi bhi website / GitHub Pages par kaise use karein</div>
+
+<div class="card">
+  <label>API Base URL</label>
+  <input id="base" value="https://osint-api-hub-xxxx.onrender.com">
+  <label>API Key</label>
+  <input id="key" value="Demo">
+  <label>Kaunsa endpoint</label>
+  <select id="ep" onchange="updateParam()">
+    <option value="num-info|q|919973700984">Number Info (/api/num-info)</option>
+    <option value="vehicle-report|number|BR30AR0802">Vehicle Report (/api/vehicle-report)</option>
+    <option value="family|q|919973700984">Family / Linked (/api/family)</option>
+    <option value="email-info|email|test@gmail.com">Email OSINT (/api/email-info)</option>
+    <option value="pass-check|password|Katihar@123">Password Check (/api/pass-check)</option>
+    <option value="ifsc|ifsc|SBIN0000001">IFSC (/api/ifsc)</option>
+    <option value="pincode|pincode|110001">Pincode (/api/pincode)</option>
+  </select>
+  <label>Value</label>
+  <input id="val" value="919973700984">
+  <label>Device ID (optional, device-lock wali keys ke liye)</label>
+  <input id="device" placeholder="mera-phone">
+  <button onclick="run()">▶ Run API</button>
+</div>
+
+<div class="card">
+  <div class="sub" id="url"></div>
+  <pre id="out">Yahan result aayega…</pre>
+</div>
+
+<script>
+function updateParam(){
+  const v = document.getElementById('ep').value.split('|');
+  document.getElementById('val').value = v[2];
+}
+async function run(){
+  const base = document.getElementById('base').value.replace(/\/$/,'');
+  const key = document.getElementById('key').value;
+  const parts = document.getElementById('ep').value.split('|');
+  const ep = parts[0], pname = parts[1];
+  const val = document.getElementById('val').value;
+  const dev = document.getElementById('device').value;
+  const url = base + '/api/' + ep + '?key=' + encodeURIComponent(key)
+            + '&' + pname + '=' + encodeURIComponent(val)
+            + '&format=text' + (dev ? '&device=' + encodeURIComponent(dev) : '');
+  document.getElementById('url').textContent = url;
+  document.getElementById('out').textContent = 'Loading…';
+  try{
+    const r = await fetch(url);
+    const txt = await r.text();
+    document.getElementById('out').textContent = (r.ok ? '' : 'HTTP '+r.status+'\n\n') + txt;
+  }catch(e){
+    document.getElementById('out').textContent = 'Error: ' + e.message +
+      '\n\nNote: browser se direct call karne ke liye API par CORS allow hona chahiye (hub me already ON hai).';
+  }
+}
+</script>
+</body>
+</html>

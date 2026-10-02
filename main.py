@@ -90,7 +90,15 @@ def init_db():
             is_active INTEGER DEFAULT 1,
             requests INTEGER DEFAULT 0,
             created_at TEXT,
-            last_used_at TEXT
+            last_used_at TEXT,
+            expires_at TEXT,
+            allowed_endpoints TEXT DEFAULT '*',
+            device_lock INTEGER DEFAULT 0,
+            bound_devices TEXT DEFAULT '',
+            max_devices INTEGER DEFAULT 1,
+            rate_limit INTEGER DEFAULT 0,
+            customer TEXT DEFAULT '',
+            price TEXT DEFAULT ''
         )""")
         c.execute("""CREATE TABLE IF NOT EXISTS custom_records (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -121,6 +129,8 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_logs_ts ON request_logs(ts)")
         conn.commit()
 
+    migrate_db()
+
     defaults = {
         "upstream_base": DEFAULT_UPSTREAM,
         "upstream_key": DEFAULT_UPSTREAM_KEY,
@@ -136,6 +146,31 @@ def init_db():
     for k, v in defaults.items():
         if get_setting(k) is None:
             set_setting(k, v)
+
+
+NEW_KEY_COLUMNS = {
+    "expires_at": "TEXT",
+    "allowed_endpoints": "TEXT DEFAULT '*'",
+    "device_lock": "INTEGER DEFAULT 0",
+    "bound_devices": "TEXT DEFAULT ''",
+    "max_devices": "INTEGER DEFAULT 1",
+    "rate_limit": "INTEGER DEFAULT 0",
+    "customer": "TEXT DEFAULT ''",
+    "price": "TEXT DEFAULT ''",
+}
+
+
+def migrate_db():
+    """Add new columns to an existing database (safe to run on every boot)."""
+    try:
+        with db() as conn:
+            existing = {r["name"] for r in conn.execute("PRAGMA table_info(api_keys)")}
+            for col, ddl in NEW_KEY_COLUMNS.items():
+                if col not in existing:
+                    conn.execute(f"ALTER TABLE api_keys ADD COLUMN {col} {ddl}")
+            conn.commit()
+    except Exception:
+        pass
 
 
 _SETTINGS_CACHE: Dict[str, str] = {}
@@ -1500,6 +1535,466 @@ def format_vehicle_report(report: Dict[str, Any], sources: List[str]) -> str:
     return "\n".join(lines)
 
 
+async def _collect_leak_records(query: str, sources: Tuple[str, ...] = ("num-info", "leak-v1", "leak-v2"),
+                                timeout: int = 35, deadline_seconds: float = 40.0
+                                ) -> Tuple[List[Tuple[Dict[str, Any], str]], List[str]]:
+    """Query given upstream sources for a query string and return (records, sources)."""
+    started = time.time()
+    records: List[Tuple[Dict[str, Any], str]] = []
+    used: List[str] = []
+    for src in sources:
+        if time.time() - started > deadline_seconds:
+            break
+        data, _ = await upstream_call(src, {"q": query}, timeout=timeout, retries=0)
+        found = _norm_records(data)
+        if found:
+            used.append(src)
+            records.extend((r, src) for r in found)
+    return records, used
+
+
+RELATION_RULES = [
+    ("father", lambda p, prim: prim.get("father_name") and p.get("name")
+     and p["name"].lower() == prim["father_name"].lower()),
+    ("same father (sibling)", lambda p, prim: p.get("father_name") and prim.get("father_name")
+     and p["father_name"].lower() == prim["father_name"].lower()),
+]
+
+
+def guess_relation(person: Dict[str, Any], primary: Dict[str, Any]) -> str:
+    name = (person.get("name") or "").lower()
+    father = (person.get("father_name") or "").lower()
+    p_name = (primary.get("name") or "").lower()
+    p_father = (primary.get("father_name") or "").lower()
+    if not name:
+        return "linked record"
+    if p_father and name == p_father:
+        return "father (as per records)"
+    if father and p_name and father == p_name:
+        return "child / dependent (same father name matches primary)"
+    if p_father and father and father == p_father and name != p_name:
+        return "possible sibling / same father"
+    # shared address token
+    prim_addr = " ".join(primary.get("addresses") or []).lower()
+    for addr in person.get("addresses") or []:
+        tokens = [t for t in re.split(r"[,\s]+", addr.lower()) if len(t) > 4]
+        if any(t in prim_addr for t in tokens[-3:]):
+            return "same address (likely family)"
+    return "linked record"
+
+
+ADDR_STOPWORDS = {
+    "bihar", "jharkhand", "delhi", "india", "state", "district", "village", "vill", "post",
+    "ward", "tola", "nagar", "road", "colony", "house", "mohalla", "thana", "police",
+    "station", "branch", "society", "apartment", "appartment", "floor", "sector", "block",
+    "street", "cross", "main", "near", "opposite", "behind", "college", "school", "hospital",
+    "uttar", "pradesh", "west", "bengal", "madhya", "pradesh", "tamil", "nadu", "andhra",
+    "arunachal", "assam", "chhattisgarh", "goa", "gujarat", "haryana", "himachal",
+    "karnataka", "kerala", "maharashtra", "manipur", "meghalaya", "mizoram", "nagaland",
+    "odisha", "punjab", "rajasthan", "sikkim", "telangana", "tripura", "kashmir", "ladakh",
+    "south", "north", "east", "west", "new", "old", "great", "little", "upper", "lower",
+}
+
+
+def addr_tokens(address: str) -> set:
+    toks = re.split(r"[^a-zA-Z0-9]+", (address or "").lower())
+    return {t for t in toks if len(t) >= 4 and t not in ADDR_STOPWORDS and not t.isdigit()}
+
+
+def locality_terms(person: Dict[str, Any], limit: int = 3) -> List[str]:
+    """Most specific address words we can search the leak DB with."""
+    counts: Dict[str, int] = {}
+    for addr in person.get("addresses") or []:
+        for tok in addr_tokens(addr):
+            counts[tok] = counts.get(tok, 0) + 1
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], -len(kv[0])))
+    return [t for t, _ in ranked[:limit]]
+
+
+async def native_family(params: Dict[str, Any], request: Request) -> Tuple[Optional[Dict], bool]:
+    """Family / linked numbers - sirf wahi log jo SAME ADDRESS ya SAME FATHER se jude hon."""
+    started = time.time()
+    q = (params.get("q") or params.get("number") or params.get("phone")
+         or params.get("name") or params.get("address") or "").strip()
+    if not q:
+        return None, True
+    deep = str(params.get("deep", "1")).lower() in ("1", "true", "yes")
+    try:
+        limit = max(1, min(int(params.get("limit") or 25), 100))
+    except Exception:
+        limit = 25
+    deadline = float(get_setting("max_request_seconds", "50") or 50)
+
+    digits = re.sub(r"\D", "", q)
+    is_number = bool(digits) and len(digits) >= 8
+    variants = phone_variants(q) if is_number else [q]
+
+    records: List[Tuple[Dict[str, Any], str]] = []
+    sources: List[str] = []
+    for variant in variants[:2]:
+        recs, used = await _collect_leak_records(
+            variant,
+            sources=("num-info", "leak-v1", "leak-v2") if is_number else ("leak-v1", "leak-v2"),
+            timeout=30, deadline_seconds=deadline * 0.5)
+        records.extend(recs)
+        sources.extend([s for s in used if s not in sources])
+        if records:
+            break
+
+    for category in ("leak", "phone", "general"):
+        for rec in custom_lookup(category, q.lower()):
+            records.append((rec, f"own-db:{category}"))
+            if f"own-db:{category}" not in sources:
+                sources.append(f"own-db:{category}")
+
+    people = merge_people(records, variants[0] if is_number else "")
+    if not people:
+        return {"success": False, "query": q, "record_count": 0, "members": [],
+                "error": "No record found for this query.", "sources_used": sources,
+                "formatted": (f"👨‍👩‍👧 FAMILY REPORT — {q}\n━━━━━━━━━━━━━━━━━━━━━━\n"
+                              "❌ Koi record nahi mila.\n"
+                              f"📶 Live data · {', '.join(sources) or 'no-source'} · "
+                              f"{now_ist('%d-%m-%Y %H:%M')}"),
+                "_no_cache": True}, True
+
+    # pick the primary person (best name match if a name was searched)
+    if not is_number:
+        ql = q.lower()
+        people.sort(key=lambda p: (ql not in (p.get("name") or "").lower(),
+                                   -(len(p.get("addresses") or []))))
+    primary = people[0]
+    primary["relation"] = "primary (jo aapne search kiya)"
+    p_tokens: set = set()
+    for addr in primary.get("addresses") or []:
+        p_tokens |= addr_tokens(addr)
+    p_father = (primary.get("father_name") or "").lower()
+    p_name = (primary.get("name") or "").lower()
+    p_phones = set(primary.get("phones") or [])
+
+    # ---- expand: search father name + specific locality words (NOT the common name) ----
+    expanded: List[Tuple[Dict[str, Any], str]] = []
+    if deep and p_tokens:
+        terms = []
+        if len(p_father) >= 8 and " s/o" not in p_father:
+            terms.append(primary["father_name"])
+        terms.extend(locality_terms(primary, limit=2))
+        for term in terms[:3]:
+            if time.time() - started > deadline * 0.8:
+                break
+            recs, used = await _collect_leak_records(term, sources=("leak-v1",),
+                                                     timeout=25, deadline_seconds=22)
+            expanded.extend(recs)
+            sources.extend([s for s in used if s not in sources])
+
+    all_people = merge_people(records + expanded, variants[0] if is_number else "")
+
+    # ---- score: same address tokens / same father / shared phone ----
+    members: List[Dict[str, Any]] = []
+    for person in all_people:
+        name = (person.get("name") or "").lower()
+        father = (person.get("father_name") or "").lower()
+        if (name, father) == (p_name, p_father):
+            continue  # primary khud
+        tokens: set = set()
+        for addr in person.get("addresses") or []:
+            tokens |= addr_tokens(addr)
+        shared = p_tokens & tokens
+        shared_phones = p_phones & set(person.get("phones") or [])
+        same_father = bool(p_father and father and father == p_father and name != p_name)
+        is_child = bool(p_name and father == p_name)
+
+        score = len(shared) + (3 if same_father else 0) + (3 if is_child else 0) + len(shared_phones)
+        if len(shared) >= 2 or (same_father and len(shared) >= 1) or (is_child and len(shared) >= 1):
+            if not name and len(shared) < 3:
+                continue  # nameless row needs a strong address match
+            person["match_score"] = score
+            person["shared_address_tokens"] = sorted(shared)[:6]
+            if is_child:
+                person["relation"] = "child / dependent (primary naam = father field me)"
+            elif same_father:
+                person["relation"] = "possible sibling / brother-sister (same father)"
+            elif len(shared) >= 3:
+                person["relation"] = "same locality / ghar (strong address match)"
+            else:
+                person["relation"] = "same address area (likely family/neighbour)"
+            members.append(person)
+
+    members.sort(key=lambda p: -p.get("match_score", 0))
+    members = members[:limit]
+    primary_out = dict(primary)
+    primary_out["match_score"] = 0
+
+    lines = [f"👨‍👩‍👧 FAMILY / LINKED NUMBERS — {q}", "━━━━━━━━━━━━━━━━━━━━━━"]
+    lines.append(f"👤 Primary: {primary.get('name') or 'NA'}"
+                 + (f" (S/O {primary['father_name']})" if primary.get("father_name") else ""))
+    if primary.get("phones"):
+        lines.append("📱 Numbers: " + ", ".join(primary["phones"][:4]))
+    if primary.get("addresses"):
+        lines.append("🏠 Address: " + _clean_text(primary["addresses"][0])[:120])
+    lines.append("────────────────────────")
+    if members:
+        lines.append(f"👥 Linked members ({len(members)}):")
+        for idx, person in enumerate(members, 1):
+            lines.append(f" {idx}. {person.get('name') or 'Unknown'} — "
+                         f"{', '.join((person.get('phones') or ['NA'])[:2])}")
+            lines.append(f"    🔗 {person['relation']}  (match {person.get('match_score')})")
+            if person.get("father_name"):
+                lines.append(f"    👨 Father: {person['father_name']}")
+            if person.get("addresses"):
+                lines.append(f"    🏠 {_clean_text(person['addresses'][0])[:110]}")
+    else:
+        lines.append("👥 Koi strong linked member nahi mila (sirf primary record hai).")
+        lines.append("   💡 &deep=1 already on hai - kabhi-kabhi data me address hi nahi hota.")
+    lines.append("────────────────────────")
+    lines.append(f"📶 Live data · {', '.join(sources) or 'no-source'} · {now_ist('%d-%m-%Y %H:%M')}")
+    lines.append("Relations guessed from address/father matching - verify before trusting.")
+
+    return {
+        "success": True,
+        "query": q,
+        "primary": primary_out,
+        "members": members,
+        "member_count": len(members),
+        "sources_used": sources,
+        "response_time": f"{round(time.time() - started, 2)}s",
+        "timestamp_ist": now_ist("%d-%m-%Y %H:%M:%S"),
+        "formatted": "\n".join(lines),
+    }, False
+
+
+EMAIL_PROVIDERS = {
+    "gmail.com": "Google (Gmail)", "googlemail.com": "Google (Gmail)",
+    "yahoo.com": "Yahoo Mail", "yahoo.co.in": "Yahoo Mail India", "ymail.com": "Yahoo Mail",
+    "outlook.com": "Microsoft (Outlook)", "hotmail.com": "Microsoft (Hotmail)",
+    "live.com": "Microsoft (Live)", "msn.com": "Microsoft (MSN)",
+    "icloud.com": "Apple (iCloud)", "me.com": "Apple (iCloud)", "mac.com": "Apple (iCloud)",
+    "rediffmail.com": "Rediffmail (India)", "rediff.com": "Rediffmail (India)",
+    "protonmail.com": "Proton Mail (encrypted)", "proton.me": "Proton Mail (encrypted)",
+    "zoho.com": "Zoho Mail", "yandex.com": "Yandex Mail", "gmx.com": "GMX Mail",
+    "mail.com": "Mail.com", "aol.com": "AOL Mail", "indiatimes.com": "Times Internet",
+    "bsnl.in": "BSNL", "airtelmail.com": "Airtel Mail", "jio.com": "Jio Mail",
+}
+DISPOSABLE_DOMAINS = {
+    "mailinator.com", "guerrillamail.com", "10minutemail.com", "tempmail.com",
+    "temp-mail.org", "yopmail.com", "trashmail.com", "throwawaymail.com",
+    "sharklasers.com", "getnada.com", "maildrop.cc", "dispostable.com", "fakeinbox.com",
+    "mailnesia.com", "emailondeck.com", "mohmal.com", "tempr.email", "guerrillamail.info",
+    "jetable.org", "spamgourmet.com", "mintemail.com", "emailtemporario.com.br",
+}
+
+
+async def native_email_info(params: Dict[str, Any], request: Request) -> Tuple[Optional[Dict], bool]:
+    """Email OSINT: validity, provider, MX records, Gravatar, leak/combo records."""
+    started = time.time()
+    email = (params.get("email") or params.get("q") or params.get("mail") or "").strip().lower()
+    if not email or "@" not in email:
+        return None, True
+    domain = email.split("@")[-1]
+    valid_format = bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[A-Za-z]{2,}", email))
+    local_part = email.split("@")[0]
+    provider = EMAIL_PROVIDERS.get(domain, "Custom / private domain")
+    disposable = domain in DISPOSABLE_DOMAINS
+    role_account = local_part in ("admin", "info", "support", "contact", "sales", "help",
+                                  "office", "hr", "billing", "noreply", "no-reply", "webmaster")
+
+    # MX / DNS records (Google DNS-over-HTTPS, free & no key)
+    mx_records: List[str] = []
+    spf = ""
+    dns_data, _ = await http_get("https://dns.google/resolve",
+                                 params={"name": domain, "type": "MX"}, timeout=15)
+    if isinstance(dns_data, dict):
+        for ans in dns_data.get("Answer", []) or []:
+            if ans.get("type") == 15:
+                mx_records.append(str(ans.get("data", "")).rstrip("."))
+    txt_data, _ = await http_get("https://dns.google/resolve",
+                                 params={"name": domain, "type": "TXT"}, timeout=15)
+    if isinstance(txt_data, dict):
+        for ans in txt_data.get("Answer", []) or []:
+            if ans.get("type") == 16 and "spf" in str(ans.get("data", "")).lower():
+                spf = str(ans.get("data", "")).strip('"')
+                break
+
+    # Gravatar (md5 of lowercased trimmed email)
+    email_hash = hashlib.md5(email.strip().encode()).hexdigest()
+    gravatar_url = f"https://www.gravatar.com/avatar/{email_hash}?d=404&s=200"
+    gravatar_found = False
+    try:
+        async with httpx.AsyncClient(timeout=12, follow_redirects=True,
+                                     headers={"User-Agent": UA}) as client:
+            g = await client.get(gravatar_url)
+            gravatar_found = g.status_code == 200
+    except Exception:
+        pass
+
+    # leak / combo list search (upstream) + own database
+    records: List[Tuple[Dict[str, Any], str]] = []
+    sources: List[str] = []
+    deadline = float(get_setting("max_request_seconds", "50") or 50)
+    for variant in (email, local_part if len(local_part) > 4 else email):
+        if time.time() - started > deadline * 0.7:
+            break
+        recs, used = await _collect_leak_records(variant, sources=("leak-v1", "leak-v2"),
+                                                 timeout=30, deadline_seconds=30)
+        for r, s in recs:
+            records.append((r, s))
+        sources.extend([s for s in used if s not in sources])
+        if records:
+            break
+    for category in ("leak", "email", "general"):
+        for rec in custom_lookup(category, email):
+            records.append((rec, f"own-db:{category}"))
+            if f"own-db:{category}" not in sources:
+                sources.append(f"own-db:{category}")
+
+    # optional HaveIBeenPwned (needs the user's own API key)
+    hibp_key = get_setting("hibp_api_key", "")
+    breaches: List[str] = []
+    hibp_note = ""
+    if hibp_key:
+        data, err = await http_get(
+            f"https://haveibeenpwned.com/api/v3/breachedaccount/{email}",
+            timeout=20, headers={"hibp-api-key": hibp_key, "user-agent": "osint-api-hub"})
+        if isinstance(data, list):
+            breaches = [b.get("Name") for b in data if isinstance(b, dict)]
+            sources.append("haveibeenpwned")
+        else:
+            hibp_note = f"HIBP lookup failed: {err}"
+    else:
+        hibp_note = ("HIBP breach list ke liye apni HaveIBeenPwned API key Settings me daalo "
+                     "(optional). Bina key ke bhi leak/combo records mil jate hain.")
+
+    # normalise leak rows
+    leak_rows: List[Dict[str, Any]] = []
+    combo_rows: List[Dict[str, Any]] = []
+    for rec, src in records:
+        row = {"source": src}
+        for key in ("full_name", "name", "the_name_of_the_father", "father_name", "phone",
+                    "address", "document_number", "region", "email", "link", "password",
+                    "username", "nick", "domain"):
+            if rec.get(key):
+                row[key] = rec[key]
+        if row.get("password") or row.get("link"):
+            row["password_masked"] = _mask(str(row.get("password"))) if row.get("password") else None
+            combo_rows.append(row)
+        else:
+            leak_rows.append(row)
+
+    lines = [f"📧 EMAIL REPORT — {email}", "━━━━━━━━━━━━━━━━━━━━━━"]
+    lines.append(f"✅ Format: {'Valid' if valid_format else 'Invalid'}")
+    lines.append(f"🏢 Provider: {provider}")
+    lines.append(f"⚠️ Disposable: {'Yes (temp mail)' if disposable else 'No'}")
+    if role_account:
+        lines.append("🏷️ Role account: Yes (admin/info type)")
+    lines.append(f"🌐 Mail server (MX): {', '.join(mx_records[:2]) if mx_records else 'NA'}")
+    if spf:
+        lines.append(f"🔐 SPF: {spf[:80]}")
+    lines.append(f"🖼️ Gravatar: {'Found' if gravatar_found else 'Not found'}")
+    if breaches:
+        lines.append(f"🔥 HIBP breaches: {len(breaches)} → " + ", ".join(breaches[:8]))
+    lines.append("────────────────────────")
+    if leak_rows:
+        lines.append(f"👤 IDENTITY RECORDS ({len(leak_rows)}):")
+        for row in leak_rows[:4]:
+            nm = _title_name(row.get("full_name") or row.get("name") or "")
+            lines.append(f" • {nm or 'Unknown'}" +
+                         (f" | 👨 {_title_name(row.get('the_name_of_the_father') or '')}"
+                          if row.get("the_name_of_the_father") else ""))
+            if row.get("phone"):
+                lines.append(f"   📱 {row['phone']}   🌐 {row.get('region', 'NA')}")
+            if row.get("address"):
+                lines.append(f"   🏠 {_clean_text(row['address'])[:110]}")
+            if row.get("document_number"):
+                lines.append(f"   🆔 {row['document_number']}")
+    if combo_rows:
+        lines.append(f"🔑 LEAKED CREDENTIALS ({len(combo_rows)}):")
+        for row in combo_rows[:5]:
+            lines.append(f" • {row.get('link') or row.get('domain') or 'source'} → "
+                         f"{row.get('password_masked') or 'NA'}")
+    if not leak_rows and not combo_rows:
+        lines.append("❌ Is email ka koi leak record nahi mila.")
+    lines.append("────────────────────────")
+    lines.append(f"📶 Live data · {', '.join(sources) or 'dns+gravatar'} · {now_ist('%d-%m-%Y %H:%M')}")
+    if hibp_note:
+        lines.append(hibp_note)
+
+    return {
+        "success": True,
+        "email": email,
+        "valid_format": valid_format,
+        "domain": domain,
+        "provider": provider,
+        "disposable": disposable,
+        "role_account": role_account,
+        "mx_records": mx_records,
+        "spf": spf,
+        "gravatar": {"found": gravatar_found, "url": gravatar_url if gravatar_found else None},
+        "hibp_breaches": breaches,
+        "identity_records": leak_rows,
+        "credential_records": combo_rows,
+        "sources_used": sources,
+        "note": hibp_note,
+        "response_time": f"{round(time.time() - started, 2)}s",
+        "timestamp_ist": now_ist("%d-%m-%Y %H:%M:%S"),
+        "formatted": "\n".join(lines),
+    }, False
+
+
+def _mask(value: str) -> str:
+    value = str(value or "")
+    if len(value) <= 2:
+        return "*" * len(value)
+    return value[0] + "*" * (len(value) - 2) + value[-1]
+
+
+async def native_pass_check(params: Dict[str, Any], request: Request) -> Tuple[Optional[Dict], bool]:
+    """Password breach check via Pwned Passwords (k-anonymity - password never leaves server)."""
+    password = params.get("password") or params.get("pass") or params.get("q") or ""
+    if not password:
+        return None, True
+    sha1 = hashlib.sha1(password.encode("utf-8")).hexdigest().upper()
+    prefix, suffix = sha1[:5], sha1[5:]
+    text, err = None, None
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True,
+                                     headers={"User-Agent": UA,
+                                              "Add-Padding": "true"}) as client:
+            resp = await client.get(f"https://api.pwnedpasswords.com/range/{prefix}")
+            text = resp.text
+    except Exception as exc:
+        err = str(exc)
+    count = 0
+    if text:
+        for line in text.splitlines():
+            if ":" in line and line.split(":")[0].upper() == suffix:
+                try:
+                    count = int(line.split(":")[1].strip())
+                except Exception:
+                    count = 1
+                break
+    lines = [f"🔑 PASSWORD CHECK — {_mask(password)}", "━━━━━━━━━━━━━━━━━━━━━━"]
+    lines.append(f"🚨 Status: {'LEAKED ❌' if count else 'Not found in known breaches ✅'}")
+    if count:
+        lines.append(f"📊 Kitni baar mila: {count:,} breaches/combo lists me")
+        lines.append("💡 Ise turant change kar do (aur kahin same password use na karo).")
+    else:
+        lines.append("💡 Ye password known leak lists me nahi mila - phir bhi strong + unique rakho.")
+    lines.append("────────────────────────")
+    lines.append(f"🔒 SHA1 prefix: {prefix}… (password kabhi server se bahar nahi gaya)")
+    lines.append(f"📶 Live data · pwnedpasswords.com · {now_ist('%d-%m-%Y %H:%M')}")
+    return {
+        "success": True,
+        "leaked": bool(count),
+        "breach_count": count,
+        "password_masked": _mask(password),
+        "sha1_prefix": prefix,
+        "length": len(password),
+        "strength_hint": ("weak" if len(password) < 8 else ("medium" if len(password) < 12 else "strong")),
+        "source": "api.pwnedpasswords.com (k-anonymity)",
+        "error": err,
+        "formatted": "\n".join(lines),
+    }, False
+
+
 async def native_num_info_full(params: Dict[str, Any], request: Request) -> Tuple[Optional[Dict], bool]:
     """Own number-intelligence API: local DB + num-info + leak-v1/v2, merged & formatted."""
     started = time.time()
@@ -1782,6 +2277,9 @@ NATIVE_FUNCS: Dict[str, Callable[..., Awaitable[Tuple[Optional[Dict], bool]]]] =
     "pan_to_gst": native_pan_to_gst,
     "num_info_full": native_num_info_full,
     "vehicle_report": native_vehicle_report,
+    "family": native_family,
+    "email_info": native_email_info,
+    "pass_check": native_pass_check,
 }
 for _kind in ("challan", "challan-v2", "challan-v4", "info", "info-v2", "rc", "details", "v"):
     NATIVE_FUNCS[f"vehicle_{_kind.replace('-', '_')}"] = None  # filled after loop (await below)
@@ -1980,6 +2478,31 @@ ENDPOINTS: List[Dict[str, Any]] = [
          native="vehicle_report", mode="native", timeout=90, cache_ttl=21600,
          params=[P("rc", "BR30AR0802")],
          desc="RC details by registration number (alias of /api/vehicle-report)."),
+
+    # ---------- New: family + email ----------
+    dict(path="family", name="Family / Linked Numbers", icon="👨‍👩‍👧", category="Leak OSINT",
+         native="family", mode="native", timeout=70, cache_ttl=43200,
+         params=[P("q", "9058390341")],
+         desc="⭐ Number ya naam daalo → uske linked/family members ke numbers (same address, "
+              "same father, alt numbers) ek card me. &format=text se ready message, &deep=0 se fast."),
+    dict(path="num-family", name="Family (alias)", icon="👨‍👩‍👧", category="Leak OSINT",
+         native="family", mode="native", timeout=70, cache_ttl=43200,
+         params=[P("q", "Pramila Hembram")],
+         desc="Alias of /api/family - naam se bhi search kar sakte hain."),
+    dict(path="email-info", name="Email OSINT", icon="📧", category="Email",
+         native="email_info", mode="native", timeout=60, cache_ttl=43200,
+         params=[P("email", "ranjitkumarlalgonv@gamil.com")],
+         desc="⭐ Email → provider, MX/SPF records, Gravatar, disposable check + leak/combo records "
+              "(naam, phone, address, leaked passwords). &format=text se card."),
+    dict(path="email", name="Email OSINT (alias)", icon="📧", category="Email",
+         native="email_info", mode="native", timeout=60, cache_ttl=43200,
+         params=[P("email", "test@gmail.com")],
+         desc="Alias of /api/email-info."),
+    dict(path="pass-check", name="Password Breach Check", icon="🔑", category="Email",
+         native="pass_check", mode="native", timeout=30, cache_ttl=86400,
+         params=[P("password", "Katihar@123")],
+         desc="Password kisi breach me hai ya nahi (Pwned Passwords k-anonymity - password server "
+              "se bahar nahi jata)."),
 ]
 
 ENDPOINT_MAP = {e["path"]: e for e in ENDPOINTS}
@@ -2045,9 +2568,56 @@ def validate_key(api_key: Optional[str]) -> Tuple[bool, str, str]:
     return False, k, "Invalid API key. Use ?key=Demo or create a key in the dashboard."
 
 
-def over_rate_limit(api_key: str) -> bool:
+def key_record(api_key: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Full key row (or a synthetic record for the Demo key)."""
+    k = (api_key or "").strip()
+    if not k:
+        return None
+    if get_setting("demo_key_enabled", "1") == "1" and k == DEMO_KEY:
+        return {"id": 0, "api_key": DEMO_KEY, "name": "Demo", "is_active": 1,
+                "expires_at": None, "allowed_endpoints": "*", "device_lock": 0,
+                "bound_devices": "", "max_devices": 0, "rate_limit": 0,
+                "customer": "public", "price": "0", "is_demo": True,
+                "requests": 0, "note": "Public demo key"}
+    row = key_row(k)
+    return dict(row) if row else None
+
+
+def days_left(expires_at: Optional[str]) -> Optional[int]:
+    if not expires_at:
+        return None
     try:
-        limit = int(get_setting("rate_limit_per_min", "120") or 0)
+        exp = datetime.strptime(expires_at, "%Y-%m-%d %H:%M:%S")
+        return (exp - datetime.now().replace(tzinfo=None)).days
+    except Exception:
+        return None
+
+
+def bind_device(rec: Dict[str, Any], device_value: str) -> Tuple[bool, int]:
+    """Device lock: bind the first device(s). Returns (allowed, bound_count)."""
+    if not device_value:
+        return True, 0
+    dev_hash = hashlib.sha256(device_value.encode()).hexdigest()[:16]
+    bound = [d for d in (rec.get("bound_devices") or "").split(",") if d]
+    if dev_hash in bound:
+        return True, len(bound)
+    limit = max(1, int(rec.get("max_devices") or 1))
+    if len(bound) >= limit:
+        return False, len(bound)
+    bound.append(dev_hash)
+    try:
+        with db() as conn:
+            conn.execute("UPDATE api_keys SET bound_devices=? WHERE api_key=?",
+                         (",".join(bound), rec["api_key"]))
+            conn.commit()
+    except Exception:
+        pass
+    return True, len(bound)
+
+
+def over_rate_limit(api_key: str, per_key_limit: int = 0) -> bool:
+    try:
+        limit = int(per_key_limit or get_setting("rate_limit_per_min", "120") or 0)
     except Exception:
         limit = 120
     if limit <= 0:
@@ -2084,7 +2654,42 @@ async def run_endpoint(request: Request, ep: Dict[str, Any]) -> JSONResponse:
     ok, key_used, err = validate_key(api_key)
     if not ok:
         return JSONResponse(error_payload(ep, err), status_code=401)
-    if over_rate_limit(key_used):
+    krec = key_record(api_key) or {}
+
+    # --- subscription checks: expiry / plan / device lock ---
+    expires_at = krec.get("expires_at")
+    if expires_at and now_ist() > expires_at:
+        return JSONResponse({
+            "success": False, "status": "expired", "endpoint": ep["path"],
+            "error": f"Your API key expired on {expires_at} (IST).",
+            "hint": "Renew karne ke liye admin se contact karein - dashboard me '+30 days' button se renew hota hai.",
+            "key": key_used[:6] + "..." + key_used[-4:] if len(key_used) > 12 else key_used,
+        }, status_code=403)
+
+    allowed = (krec.get("allowed_endpoints") or "*").strip()
+    if allowed not in ("*", "all", ""):
+        permitted = {x.strip() for x in allowed.split(",") if x.strip()}
+        if ep["path"] not in permitted:
+            return JSONResponse({
+                "success": False, "status": "not_in_plan", "endpoint": ep["path"],
+                "error": f"Aapka plan is endpoint ko allow nahi karta: /api/{ep['path']}",
+                "your_plan": sorted(permitted),
+                "hint": "Admin se apna plan upgrade karwao (dashboard -> API Keys -> plan edit).",
+            }, status_code=403)
+
+    if int(krec.get("device_lock") or 0) == 1:
+        device_value = (request.query_params.get("device")
+                        or request.headers.get("x-device-id")
+                        or client_ip(request))
+        ok_device, bound_count = bind_device(krec, device_value)
+        if not ok_device:
+            return JSONResponse({
+                "success": False, "status": "device_locked", "endpoint": ep["path"],
+                "error": f"Ye key kisi aur device se lock hai ({bound_count}/{krec.get('max_devices') or 1} devices).",
+                "hint": "Apne device se pehli baar call karte waqt ?device=<apna-naam> lagao, ya admin se unlock karwao.",
+            }, status_code=403)
+
+    if over_rate_limit(key_used, int(krec.get("rate_limit") or 0)):
         return JSONResponse(error_payload(
             ep, "Rate limit exceeded. Wait a minute or raise the limit in the dashboard."), status_code=429)
 
@@ -2474,31 +3079,128 @@ async def admin_export_records(request: Request, category: str = ""):
                              headers={"Content-Disposition": "attachment; filename=osint_records.csv"})
 
 
+def _key_dict(row: sqlite3.Row) -> Dict[str, Any]:
+    rec = dict(row)
+    rec["days_left"] = days_left(rec.get("expires_at"))
+    rec["is_expired"] = bool(rec.get("expires_at") and now_ist() > rec["expires_at"])
+    rec["bound_device_count"] = len([d for d in (rec.get("bound_devices") or "").split(",") if d])
+    return rec
+
+
 @app.get("/admin/keys")
 async def admin_list_keys(request: Request):
     require_admin(request)
     with db() as conn:
         rows = conn.execute("SELECT * FROM api_keys ORDER BY id DESC").fetchall()
-    return {"success": True, "keys": [dict(r) for r in rows]}
+    return {"success": True, "keys": [_key_dict(r) for r in rows],
+            "endpoints": [e["path"] for e in ENDPOINTS]}
 
 
 @app.post("/admin/keys")
 async def admin_create_key(request: Request, payload: Dict[str, Any] = Body(default={})):
+    """Create a sellable key: name, validity days, plan (endpoints), device lock."""
     require_admin(request)
     import string
     alphabet = string.ascii_letters + string.digits
     new_key = (payload.get("custom_key") or "").strip()
     if not new_key:
         new_key = "osint-" + "".join(secrets.choice(alphabet) for _ in range(24))
+    days = int(payload.get("days") or 0)
+    expires_at = (datetime.now(IST) + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S") if days > 0 else None
+    endpoints = (payload.get("allowed_endpoints") or payload.get("plan") or "*").strip() or "*"
     with db() as conn:
         exists = conn.execute("SELECT id FROM api_keys WHERE api_key=?", (new_key,)).fetchone()
         if exists:
             return JSONResponse({"success": False, "error": "Key already exists"}, status_code=400)
-        conn.execute("INSERT INTO api_keys(api_key,name,note,is_active,requests,created_at)"
-                     " VALUES(?,?,?,1,0,?)",
-                     (new_key, payload.get("name", ""), payload.get("note", ""), now_ist()))
+        cur = conn.execute(
+            "INSERT INTO api_keys(api_key,name,note,is_active,requests,created_at,expires_at,"
+            "allowed_endpoints,device_lock,bound_devices,max_devices,rate_limit,customer,price)"
+            " VALUES(?,?,?,1,0,?,?,?,?,?,?,?,?,?)",
+            (new_key, payload.get("name", "") or payload.get("customer", ""),
+             payload.get("note", ""), now_ist(), expires_at, endpoints,
+             int(payload.get("device_lock") or 0), "",
+             max(1, int(payload.get("max_devices") or 1)),
+             int(payload.get("rate_limit") or 0),
+             payload.get("customer", "") or payload.get("name", ""),
+             str(payload.get("price", ""))))
         conn.commit()
-    return {"success": True, "api_key": new_key}
+        new_id = cur.lastrowid
+    return {"success": True, "api_key": new_key, "id": new_id, "expires_at": expires_at,
+            "days": days, "allowed_endpoints": endpoints}
+
+
+@app.post("/admin/keys/{key_id}/extend")
+async def admin_extend_key(key_id: int, request: Request,
+                           payload: Dict[str, Any] = Body(default={})):
+    """Renew a key: add N days (from today, or from its old expiry if still valid)."""
+    require_admin(request)
+    days = int(payload.get("days") or 30)
+    with db() as conn:
+        row = conn.execute("SELECT * FROM api_keys WHERE id=?", (key_id,)).fetchone()
+        if not row:
+            return JSONResponse({"success": False, "error": "Key not found"}, status_code=404)
+        current = row["expires_at"]
+        base = datetime.now(IST).replace(tzinfo=None)
+        if current:
+            try:
+                old = datetime.strptime(current, "%Y-%m-%d %H:%M:%S")
+                if old > base:
+                    base = old
+            except Exception:
+                pass
+        new_expiry = (base + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute("UPDATE api_keys SET expires_at=?, is_active=1 WHERE id=?", (new_expiry, key_id))
+        conn.commit()
+    return {"success": True, "expires_at": new_expiry, "days_added": days}
+
+
+@app.post("/admin/keys/{key_id}/plan")
+async def admin_set_plan(key_id: int, request: Request,
+                         payload: Dict[str, Any] = Body(default={})):
+    """Change plan (allowed endpoints), device lock, device limit, rate limit, expiry date."""
+    require_admin(request)
+    fields, values = [], []
+    if payload.get("allowed_endpoints") is not None:
+        fields.append("allowed_endpoints=?")
+        values.append((payload["allowed_endpoints"] or "*").strip() or "*")
+    if payload.get("device_lock") is not None:
+        fields.append("device_lock=?")
+        values.append(int(payload["device_lock"]))
+    if payload.get("max_devices") is not None:
+        fields.append("max_devices=?")
+        values.append(max(1, int(payload["max_devices"])))
+    if payload.get("rate_limit") is not None:
+        fields.append("rate_limit=?")
+        values.append(int(payload["rate_limit"]))
+    if payload.get("expires_at") is not None:
+        fields.append("expires_at=?")
+        values.append(payload["expires_at"] or None)
+    if payload.get("name") is not None:
+        fields.append("name=?")
+        values.append(payload["name"])
+    if payload.get("customer") is not None:
+        fields.append("customer=?")
+        values.append(payload["customer"])
+    if payload.get("price") is not None:
+        fields.append("price=?")
+        values.append(str(payload["price"]))
+    if not fields:
+        return {"success": True, "updated": 0}
+    values.append(key_id)
+    with db() as conn:
+        conn.execute(f"UPDATE api_keys SET {', '.join(fields)} WHERE id=?", values)
+        conn.commit()
+    return {"success": True, "updated": len(fields)}
+
+
+@app.post("/admin/keys/{key_id}/unbind")
+async def admin_unbind_devices(key_id: int, request: Request):
+    """Device lock reset: key ko kisi bhi naye device par chalne do."""
+    require_admin(request)
+    with db() as conn:
+        conn.execute("UPDATE api_keys SET bound_devices='' WHERE id=?", (key_id,))
+        conn.commit()
+    return {"success": True}
 
 
 @app.post("/admin/keys/{key_id}/toggle")
@@ -2589,6 +3291,35 @@ async def list_endpoints(request: Request):
             "example": f"{base}/api/{e['path']}?key={DEMO_KEY}&" +
                        "&".join(f"{p['name']}={p['sample']}" for p in e["params"]),
         } for e in ENDPOINTS],
+    }
+
+
+@app.get("/api/key-info")
+async def api_key_info(request: Request, key: str = ""):
+    """Customers can check their own key: plan, expiry, remaining days, usage."""
+    ok, key_used, err = validate_key(key)
+    if not ok:
+        return JSONResponse({"success": False, "error": err}, status_code=401)
+    rec = key_record(key_used) or {}
+    allowed = (rec.get("allowed_endpoints") or "*").strip()
+    permitted = sorted({x.strip() for x in allowed.split(",") if x.strip()}) if allowed not in ("*", "all") else ["ALL"]
+    return {
+        "success": True,
+        "key": key_used if rec.get("is_demo") else key_used[:6] + "..." + key_used[-4:],
+        "customer": rec.get("customer") or rec.get("name") or "",
+        "plan": "ALL ENDPOINTS" if permitted == ["ALL"] else permitted,
+        "allowed_endpoints": permitted,
+        "expires_at_ist": rec.get("expires_at") or "Never (lifetime)",
+        "days_left": days_left(rec.get("expires_at")),
+        "status": ("expired" if (rec.get("expires_at") and now_ist() > rec["expires_at"])
+                   else ("active" if int(rec.get("is_active", 1)) else "disabled")),
+        "device_lock": bool(int(rec.get("device_lock") or 0)),
+        "devices_bound": len([d for d in (rec.get("bound_devices") or "").split(",") if d]),
+        "max_devices": int(rec.get("max_devices") or 1),
+        "requests_used": rec.get("requests", 0),
+        "last_used_at": rec.get("last_used_at") or "",
+        "rate_limit_per_min": int(rec.get("rate_limit") or 0) or int(get_setting("rate_limit_per_min", "120")),
+        "server_time_ist": now_ist(),
     }
 
 
@@ -2788,16 +3519,57 @@ a{color:#79c0ff}
 <!-- KEYS -->
 <div id="tab-keys" class="hidden">
   <div class="card">
-    <h2>🔑 Create New API Key</h2>
+    <h2>💰 Sell Naya API Key (plan + expiry)</h2>
     <div class="row">
-      <div><label>Name / Owner</label><input id="keyName" placeholder="Rohit bhai"></div>
-      <div><label>Custom key (optional)</label><input id="keyCustom" placeholder="khali chhod do to auto ban jayega"></div>
+      <div><label>Customer naam</label><input id="keyName" placeholder="Rohit bhai"></div>
+      <div><label>Validity</label>
+        <select id="keyDays">
+          <option value="7">7 din (trial)</option>
+          <option value="15">15 din</option>
+          <option value="30" selected>30 din (1 month - ₹100)</option>
+          <option value="90">90 din (3 month)</option>
+          <option value="180">180 din</option>
+          <option value="365">365 din (1 saal)</option>
+          <option value="0">Lifetime (kabhi expire nahi)</option>
+        </select>
+      </div>
     </div>
-    <button class="action" onclick="createKey()">Create Key</button>
+    <div class="row">
+      <div><label>Plan (kaunsi API)</label>
+        <select id="keyPlan" onchange="togglePlanBox()">
+          <option value="*">SAB endpoints (full access)</option>
+          <option value="num-info,vehicle-report,family,email-info">Popular pack (num-info + vehicle-report + family + email-info)</option>
+          <option value="num-info,family">Sirf Number pack (num-info + family)</option>
+          <option value="vehicle-report,vehicle-rc,vehicle-challan">Sirf Vehicle pack</option>
+          <option value="email-info,pass-check">Sirf Email pack</option>
+          <option value="custom">Custom (khud likho)</option>
+        </select>
+      </div>
+      <div id="customPlanBox" style="display:none">
+        <label>Endpoints (comma separated)</label>
+        <input id="keyEndpoints" placeholder="num-info,vehicle-report">
+      </div>
+    </div>
+    <div class="row">
+      <div><label>Device lock</label>
+        <select id="keyDeviceLock">
+          <option value="1">ON - 1 device me hi chalega</option>
+          <option value="0" selected>OFF - kahin bhi chalega</option>
+        </select>
+      </div>
+      <div><label>Max devices (lock ON ho to)</label><input id="keyMaxDev" type="number" value="1"></div>
+    </div>
+    <div class="row">
+      <div><label>Custom key (optional)</label><input id="keyCustom" placeholder="khali chhod do to auto ban jayega"></div>
+      <div><label>Price note ( sirf record ke liye)</label><input id="keyPrice" placeholder="100"></div>
+    </div>
+    <button class="action" onclick="createKey()">Create &amp; Sell Key</button>
   </div>
+
   <div class="card">
-    <h2>📋 Existing Keys</h2>
-    <p style="color:var(--muted);margin-top:0">Demo key <code>Demo</code> hamesha kaam karta hai (Settings me band kar sakte ho).</p>
+    <h2>📋 Keys / Subscribers</h2>
+    <p style="color:var(--muted);margin-top:0">Demo key <code>Demo</code> sabke liye hai (Settings me band kar sakte ho).
+    Customer ko key + niche diya hua URL example bhej do.</p>
     <button class="ghost small" onclick="loadKeys()">Refresh</button>
     <div id="keyList" style="margin-top:10px"></div>
   </div>
@@ -3042,26 +3814,99 @@ async function importCsv(){
 }
 function exportCsv(){ window.open('/admin/records/export?token='+encodeURIComponent(TOKEN),'_blank'); }
 
-/* ---------- keys ---------- */
+/* ---------- keys / subscriptions ---------- */
+function togglePlanBox(){
+  const v = document.getElementById('keyPlan').value;
+  document.getElementById('customPlanBox').style.display = (v==='custom') ? '' : 'none';
+}
+function planValue(){
+  const v = document.getElementById('keyPlan').value;
+  if(v==='custom'){ return document.getElementById('keyEndpoints').value || '*'; }
+  return v;
+}
 async function loadKeys(){
   try{
     const j = await adminFetch('/admin/keys');
     if(!j.success) return;
-    document.getElementById('keyList').innerHTML =
-      '<table><tr><th>ID</th><th>Key</th><th>Name</th><th>Requests</th><th>Status</th><th></th></tr>'+
-      j.keys.map(k=>'<tr><td>'+k.id+'</td><td><code>'+k.api_key+'</code></td><td>'+(k.name||'')+'</td>'+
-      '<td>'+k.requests+'</td><td>'+(k.is_active?'<span class="ok">Active</span>':'<span class="bad">Disabled</span>')+'</td>'+
-      '<td><button class="ghost small" onclick="toggleKey('+k.id+')">'+(k.is_active?'Disable':'Enable')+'</button>'+
-      '<button class="danger small" onclick="delKey('+k.id+')">🗑</button></td></tr>').join('')+'</table>';
+    const short = k => k.length>16 ? k.slice(0,10)+'...'+k.slice(-4) : k;
+    document.getElementById('keyList').innerHTML = j.keys.length ?
+      '<table><tr><th>Key</th><th>Customer</th><th>Plan</th><th>Expiry</th><th>Devices</th><th>Use</th><th>Actions</th></tr>'+
+      j.keys.map(k=>{
+        const dl = k.days_left;
+        const expTxt = k.expires_at ? (k.expires_at.slice(0,16) + ' (' + (dl===null?'?':dl) + 'd left)') : 'Lifetime';
+        const expColor = k.is_expired ? 'bad' : (dl!==null && dl<=3 ? 'warn' : 'ok');
+        const plan = (k.allowed_endpoints==='*'||!k.allowed_endpoints) ? 'ALL' :
+                      k.allowed_endpoints.split(',').length + ' APIs: '+k.allowed_endpoints;
+        return '<tr><td><code>'+short(k.api_key)+'</code> '+
+          '<button class="ghost small" onclick=\'copyText("'+k.api_key+'")\'>📋</button></td>'+
+          '<td>'+(k.customer||k.name||'')+'</td><td class="src">'+plan+'</td>'+
+          '<td class="'+expColor+'">'+expTxt+'</td>'+
+          '<td>'+(k.device_lock? ('🔒 '+k.bound_device_count+'/'+k.max_devices) : '🔓 off')+'</td>'+
+          '<td>'+k.requests+'</td>'+
+          '<td><button class="ghost small" onclick="extendKey('+k.id+',30)">+30d</button>'+
+          '<button class="ghost small" onclick="extendKey('+k.id+',7)">+7d</button>'+
+          '<button class="ghost small" onclick="extendKey('+k.id+',365)">+1y</button>'+
+          '<button class="ghost small" onclick="toggleDeviceLock('+k.id+','+k.device_lock+')">'+(k.device_lock?'🔓 Unlock':'🔒 Lock')+'</button>'+
+          '<button class="ghost small" onclick="unbindKey('+k.id+')">♻️ Reset device</button>'+
+          '<button class="ghost small" onclick="showCustomerMsg('+k.id+')">📤 Bhejo</button>'+
+          '<button class="ghost small" onclick="toggleKey('+k.id+')">'+(k.is_active?'Disable':'Enable')+'</button>'+
+          '<button class="danger small" onclick="delKey('+k.id+')">🗑</button></td></tr>';
+      }).join('')+'</table>' : '<p style="color:var(--muted)">Abhi koi key nahi bani.</p>';
   }catch(e){}
 }
+function copyText(t){ navigator.clipboard.writeText(t); toast('Copied!'); }
 async function createKey(){
-  const r = await fetch('/admin/keys',{method:'POST',headers:adminHeaders(),
-    body:JSON.stringify({name:document.getElementById('keyName').value, custom_key:document.getElementById('keyCustom').value})});
+  const payload = {name: document.getElementById('keyName').value,
+    days: parseInt(document.getElementById('keyDays').value||'30'),
+    allowed_endpoints: planValue(),
+    device_lock: parseInt(document.getElementById('keyDeviceLock').value||'0'),
+    max_devices: parseInt(document.getElementById('keyMaxDev').value||'1'),
+    custom_key: document.getElementById('keyCustom').value,
+    customer: document.getElementById('keyName').value,
+    price: document.getElementById('keyPrice').value};
+  const r = await fetch('/admin/keys',{method:'POST',headers:adminHeaders(),body:JSON.stringify(payload)});
   const j = await r.json();
-  if(j.success){ toast('Key created ✅'); document.getElementById('keyName').value='';
-    document.getElementById('keyCustom').value=''; loadKeys(); alert('New API key:\n\n'+j.api_key); }
-  else toast(j.error||'Error', true);
+  if(j.success){
+    toast('Key ban gayi ✅');
+    document.getElementById('keyName').value=''; document.getElementById('keyCustom').value='';
+    loadKeys();
+    alert('NAYA API KEY (customer ko bhej do)\n\n'+j.api_key+'\n\nValidity: '+(j.expires_at||'Lifetime')+'\nPlan: '+j.allowed_endpoints);
+  } else toast(j.error||'Error', true);
+}
+async function extendKey(id, days){
+  const r = await fetch('/admin/keys/'+id+'/extend',{method:'POST',headers:adminHeaders(),
+    body:JSON.stringify({days:days})});
+  const j = await r.json();
+  toast('Renew ho gaya ✅ naya expiry: '+(j.expires_at||'')); loadKeys();
+}
+async function toggleDeviceLock(id, current){
+  const r = await fetch('/admin/keys/'+id+'/plan',{method:'POST',headers:adminHeaders(),
+    body:JSON.stringify({device_lock: current?0:1})});
+  toast(current?'Device lock OFF ✅':'Device lock ON ✅'); loadKeys();
+}
+async function unbindKey(id){
+  await fetch('/admin/keys/'+id+'/unbind',{method:'POST',headers:adminHeaders()});
+  toast('Device reset ✅ naya device bind hoga'); loadKeys();
+}
+async function showCustomerMsg(id){
+  try{
+    const j = await adminFetch('/admin/keys');
+    const k = (j.keys||[]).find(x=>x.id===id);
+    if(!k) return;
+    const base = location.origin;
+    const plan = (k.allowed_endpoints==='*'||!k.allowed_endpoints)?'All endpoints':k.allowed_endpoints;
+    const msg = '✅ Aapka OSINT API key ready hai\n\n'+
+      '🔑 Key: '+k.api_key+'\n'+
+      '📦 Plan: '+plan+'\n'+
+      '⏳ Valid till: '+(k.expires_at||'Lifetime')+'\n\n'+
+      '📌 Examples:\n'+
+      base+'/api/num-info?key='+k.api_key+'&q=919973700984&format=text\n'+
+      base+'/api/vehicle-report?key='+k.api_key+'&number=BR30AR0802&format=text\n'+
+      base+'/api/family?key='+k.api_key+'&q=919973700984&format=text\n'+
+      base+'/api/email-info?key='+k.api_key+'&email=test@gmail.com&format=text\n\n'+
+      '🔎 Apni key check karo: '+base+'/api/key-info?key='+k.api_key;
+    prompt('Ye message copy kar ke customer ko bhej do:', msg);
+  }catch(e){}
 }
 async function toggleKey(id){ await fetch('/admin/keys/'+id+'/toggle',{method:'POST',headers:adminHeaders()}); loadKeys(); }
 async function delKey(id){ if(!confirm('Delete key?')) return;

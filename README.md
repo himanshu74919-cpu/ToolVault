@@ -1,9 +1,9 @@
-# 🛰️ OSINT & Multi-Utility API Hub (48 Endpoints + SQLite Database + Dashboard)
+# 🛰️ OSINT & Multi-Utility API Hub (53 Endpoints + SQLite Database + Dashboard)
 
 Ye ek **ready-to-use API Hub** hai jo `https://osint-apis-hub.onrender.com` jaisi hi endpoint
 structure follow karta hai, lekin isme extra milta hai:
 
-* ✅ **48 endpoints** – `?key=Demo` ya aapki khud ki API key se
+* ✅ **53 endpoints** – `?key=Demo` ya aapki khud ki API key se
 * ✅ **SQLite database** – apna khud ka data (leak records, phone, GST, PAN, vehicle…) dashboard se add karein
 * ✅ **Web Dashboard** (`/dashboard`) – tablet/mobile friendly, bina coding ke sab kuch control
 * ✅ **Smart fallback** – har endpoint pehle free native source try karta hai, agar poori data
@@ -192,7 +192,7 @@ Agar aapko `Demo` key band karni ho to: **Settings → Demo key enabled → No �
 
 ---
 
-## 📋 Pure 48 Endpoints (Base URL ke saath)
+## 📋 Pure 53 Endpoints (Base URL ke saath)
 
 Base URL example: `https://aapka-url.onrender.com` (ya local me `http://localhost:8000`)
 
@@ -282,6 +282,270 @@ Base URL example: `https://aapka-url.onrender.com` (ya local me `http://localhos
 
 (`/api/num-info` upar #34 me hai — wo ab full merged report deta hai.)
 
+
+### 🆕 Naye (Family + Email)
+| # | Endpoint | Example |
+|---|----------|---------|
+| 49 | `/api/family` | `?key=Demo&q=919973700984` — linked/family numbers (same address / same father) |
+| 50 | `/api/num-family` | `?key=Demo&q=Pramila Hembram` — alias, naam se bhi search |
+| 51 | `/api/email-info` | `?key=Demo&email=ranjitkumarlalgonv@gamil.com` |
+| 52 | `/api/email` | alias of email-info |
+| 53 | `/api/pass-check` | `?key=Demo&password=Katihar@123` — breach count (k-anonymity) |
+
+---
+
+## 👨‍👩‍👧 `/api/family` — Family / Linked Numbers (NEW)
+
+Number ya naam daalo → **sirf wahi log** dikhte hain jinke
+**address ke words match** karte hain ya **father ka naam same** hai.
+(Bakwas results hatane ke liye smart scoring use hota hai.)
+
+```
+GET /api/family?key=Demo&q=919973700984&format=text
+```
+
+```
+👨‍👩‍👧 FAMILY / LINKED NUMBERS — 919973700984
+━━━━━━━━━━━━━━━━━━━━━━
+👤 Primary: Anurag Ranjan (S/O Akhilesh Kumar Ray)
+📱 Numbers: 919973700984, 917352858502
+🏠 Address: khajauli,Khajaui Urf Aurangabad,...,Vaishali,Bihar,844121
+────────────────────────
+👥 Linked members (14):
+ 1. Abhijeet Kumar — 919973700984, 917070341551
+    🔗 possible sibling / brother-sister (same father)  (match 6)
+    👨 Father: Akhilesh Kumar Ray
+    🏠 Paharpur,Vaishali Prataptand Lalganj,Bihar,844123
+ 2. Chandan Kumar — ..., 917367945181
+    🔗 possible sibling (same father)
+...
+📶 Live data · num-info, leak-v1 · 02-10-2026 22:52
+Relations guessed from address/father matching - verify before trusting.
+```
+
+Params: `q` (number / naam), `&limit=25` (max members), `&deep=0` (fast, bina extra search),
+`&format=text` (card).
+
+---
+
+## 📧 `/api/email-info` — Email OSINT (NEW)
+
+```
+GET /api/email-info?key=Demo&email=ranjitkumarlalgonv@gamil.com&format=text
+```
+
+```
+📧 EMAIL REPORT — ranjitkumarlalgonv@gamil.com
+━━━━━━━━━━━━━━━━━━━━━━
+✅ Format: Valid
+🏢 Provider: Custom / private domain
+⚠️ Disposable: No
+🌐 Mail server (MX): 0 mail.gamil.com
+🔐 SPF: v=spf1 a mx include:... -all
+🖼️ Gravatar: Not found
+────────────────────────
+👤 IDENTITY RECORDS (25):
+ • Pramila Hembram | 👨 Ratan Tudu
+   📱 9973700987   🌐 JIO BHR&JHR
+   🏠 w/o ratan tudu,Jhawa,sohasa...,katihar,Bihar,855113
+   🆔 300664932743
+────────────────────────
+📶 Live data · leak-v1 · 02-10-2026 22:48
+```
+
+Milta hai: format validity, provider, disposable check, MX + SPF (Google DNS), Gravatar,
+**leak records** (naam/phone/address/ID) aur leaked credentials (masked password).
+Optional: Settings me apni **HaveIBeenPwned API key** daalo to HIBP breach list bhi aayegi.
+
+## 🔑 `/api/pass-check` — Password Breach Check (BONUS)
+
+```
+GET /api/pass-check?key=Demo&password=Katihar@123&format=text
+```
+```
+🔑 PASSWORD CHECK — K*********3
+🚨 Status: LEAKED ❌
+📊 Kitni baar mila: 4,097 breaches/combo lists me
+🔒 SHA1 prefix: 3BF2D… (password kabhi server se bahar nahi gaya)
+```
+(Pwned Passwords **k-anonymity** — sirf hash ka 5-letter prefix bheja jata hai.)
+
+---
+
+# 💰 API BECHNA KAISE HAIN (₹100 / month wala pura system)
+
+Ye sab **built-in** hai, koi extra coding nahi chahiye:
+
+## Step 1 — Customer ka key banao (Dashboard → API Keys)
+| Field | Kya bharein |
+|-------|-------------|
+| Customer naam | jise bech rahe ho |
+| Validity | `30 din` (= 1 month ₹100), `90 din`, `365 din`, ya `Lifetime` |
+| Plan | `SAB endpoints` / `Popular pack` / `Sirf Number pack` / `Custom` (comma separated) |
+| Device lock | `ON` → key sirf 1 device (phone/PC) par chalegi |
+| Price note | sirf record ke liye (₹100) |
+
+**Create** dabaate hi key ban jati hai → customer ko bhej do.
+
+## Step 2 — Month khatam hone par kya hoga?
+* Expiry ke baad har request par **403** milega:
+```json
+{"success":false,"status":"expired","error":"Your API key expired on 2026-11-01 22:50:57 (IST)."}
+```
+* Dashboard me expiry **red** dikhegi (`days_left` negative).
+* Payment milte hi **+30d** button dabao → `POST /admin/keys/{id}/extend` →
+  naya expiry = (purana expiry ya aaj, jo bhi baad ho) + 30 din. **Key turant wapas chalu.**
+
+## Step 3 — Device lock kaise kaam karta hai
+* `device_lock=1` + `max_devices=1` → pehli request jis IP / `?device=ID` se aayi, wahi bind ho gaya.
+* Doosre device se call → `403 device_locked`.
+* Customer ko naye phone par chalana ho to dashboard me **♻️ Reset device** dabao
+  (`POST /admin/keys/{id}/unbind`) → naya device bind ho jayega.
+* Customer apne bot me `&device=myname` lagaye to IP change hone par bhi lock safe rahega.
+
+## Step 4 — Customer khud status check kare
+```
+GET https://aapka-url.onrender.com/api/key-info?key=<uski_key>
+```
+```json
+{"plan":["num-info","vehicle-report"],"expires_at_ist":"2026-11-01 22:50:57",
+ "days_left":30,"status":"active","device_lock":true,"requests_used":1}
+```
+
+## Step 5 — Plan ke bahar wali API
+```
+GET /api/family?key=<sirf num-info wala key>&q=...
+```
+```json
+{"success":false,"status":"not_in_plan","error":"Aapka plan is endpoint ko allow nahi karta",
+ "your_plan":["num-info","vehicle-report"]}
+```
+
+## Pricing ideas (aap marzi se)
+| Plan | Validity | Endpoints | Price |
+|------|----------|-----------|-------|
+| Trial | 7 din | num-info + family | free / ₹20 |
+| Number pack | 30 din | num-info, family, num | ₹100 |
+| Vehicle pack | 30 din | vehicle-report, vehicle-rc, vehicle-challan* | ₹100 |
+| Email pack | 30 din | email-info, pass-check | ₹100 |
+| Full access | 30 din | `*` (sab) | ₹200–300 |
+| Reseller | 365 din | `*` | ₹1000+ |
+
+Payment lene ke liye: UPI QR / PhonePe / Paytm / Google Pay — aur key WhatsApp pe bhej do.
+Dashboard → Keys → **📤 Bhejo** button customer ko bhejne layak poora message de deta hai.
+
+---
+
+# 🤖 Telegram Bot me use kaise karein
+
+`examples/telegram_bot.py` ready hai. Bas 3 line me apna data bharein
+(`BOT_TOKEN`, `API_BASE`, `API_KEY`) aur `python telegram_bot.py` chalao.
+
+Commands: `/num 919973700984`, `/vehicle BR30AR0802`, `/family 919973700984`,
+`/email test@gmail.com`, `/pass mypassword`, `/key`.
+
+Har command `&format=text` use karta hai, isliye response seedha card ki tarah dikhta hai.
+
+> Bot host karne ke liye bhi Render use kar sakte ho (Background Worker) ya apne PC/tablet
+> (Termux) par chala sakte ho.
+
+# 🌐 Website me use kaise karein
+
+`examples/website_demo.html` kholo → base URL + key daalo → Run.
+CORS hub me pehle se **ON** hai, isliye koi bhi website (ya GitHub Pages) direct call kar sakti hai.
+
+JavaScript example:
+```js
+const r = await fetch("https://aapka-url.onrender.com/api/num-info?key=Demo&q=919973700984&format=text");
+document.getElementById("out").textContent = await r.text();
+```
+
+PHP example:
+```php
+$txt = file_get_contents("https://aapka-url.onrender.com/api/num-info?key=Demo&q=919973700984&format=text");
+echo $txt;
+```
+
+Python example:
+```python
+import requests
+print(requests.get("https://aapka-url.onrender.com/api/vehicle-report",
+                   params={"key":"Demo","number":"BR30AR0802","format":"text"}, timeout=90).text)
+```
+
+---
+
+# 📤 GITHUB PE NAYA REPOSITORY KAISE BANAYEIN (step by step)
+
+**A. GitHub account + naya Gmail**
+1. [github.com](https://github.com) kholo → **Sign up** → apna naya Gmail daalo → password banao → verify karo.
+2. Login ke baad upar right me **+ → New repository**.
+3. **Repository name**: `osint-api-hub`
+4. **Public** select karo (Render free tier public repo ke saath best kaam karta hai; private bhi chalega par GitHub se connect karte waqt permission deni padti hai).
+5. **Add a README file** ko tick kar do (baaki sab unchecked).
+6. **Create repository** dabao.
+
+**B. Files upload kaise karein (bina coding ke, browser se)**
+1. Repo page par **Add file → Upload files**.
+2. In files ko drag & drop karo (sab ek saath):
+   `main.py`, `requirements.txt`, `render.yaml`, `Procfile`, `Dockerfile`, `README.md`, `.gitignore`
+   aur `examples/` folder ki files (folder ke liye: `examples` naam se naya file →
+   `examples/telegram_bot.py` type kar ke slash daba do, GitHub folder bana deta hai).
+3. Niche **Commit changes** (green button) dabao. Ho gaya — code GitHub par hai ✅
+
+> (Agar aap chahein to mujhe GitHub username + token de do, main khud push kar dunga.)
+
+**C. Personal Access Token (agar main push karun to)**
+1. GitHub → right-top profile photo → **Settings** → **Developer settings** (sabse niche).
+2. **Personal access tokens → Tokens (classic) → Generate new token (classic)**.
+3. Note: `osint-hub`, expiration: `30 days`, **repo** ka checkbox tick karo.
+4. **Generate token** → token copy kar lo (ek hi baar dikhta hai).
+5. Kaam ho jane ke baad token ko **Delete** kar dena (safety).
+
+---
+
+# ☁️ RENDER PE DEPLOY — step by step (Tablet/Phone se bhi ho jayega)
+
+1. [render.com](https://render.com) kholo → **Get Started** → **Sign in with GitHub** → authorize karo.
+2. Dashboard par **New +** button (upar right) → **Blueprint**.
+3. Apna repo (`osint-api-hub`) select karo → **Connect**.
+   - Render `render.yaml` khud padh lega: plan `free`, runtime `python`,
+     build `pip install -r requirements.txt`, start `uvicorn main:app --host 0.0.0.0 --port $PORT`.
+4. **Apply** dabao → 2–4 minute me deploy ho jayega.
+5. Upar mila URL (jaise `https://osint-api-hub-xxxx.onrender.com`) copy karo.
+6. **Environment** tab me jaakar set karo:
+   - `ADMIN_PASSWORD` = apna strong password (zaroor badlo!)
+   - `DEMO_KEY` = `Demo` (ya kuch aur)
+7. Test: browser me `https://...onrender.com/dashboard` kholo → wahi dashboard dikhega.
+8. Pehla API test:
+   `https://...onrender.com/api/num-info?key=Demo&q=919973700984&format=text`
+
+### Render free tier ke rules
+* 15 minute tak koi request na aaye to service **sleep** ho jati hai; agle request me 30–60s lagte hain (cold start).
+* Sleep se bachne ke liye: [cron-job.org](https://cron-job.org) ya [uptimerobot.com](https://uptimerobot.com)
+  par free account banao aur har 10 minute me apne `/health` URL ko ping karwao.
+* Free tier ki disk temporary hai → **Database tab se CSV export karte raho** (backup).
+
+### Deploy ke baad kya karein (5 minute ka checklist)
+- [ ] Dashboard kholo, `ADMIN_PASSWORD` se login karo
+- [ ] Settings me `Demo` key ko ON/OFF decide karo (selling ke liye OFF rakhna better)
+- [ ] API Keys tab se pehla customer key banao (30 din, plan select karke)
+- [ ] `examples/telegram_bot.py` me apna Render URL + token + key daal kar bot chalao
+- [ ] Har hafte Database → Export CSV se backup le lo
+
+---
+
+## 🆘 Koi problem aaye to
+| Problem | Solution |
+|---------|----------|
+| `502 / no data` | Upstream (source) down hai — thodi der baad try karo; purana cached result bhi mil jata hai |
+| `401 invalid key` | `?key=Demo` lagao ya dashboard se naya key banao |
+| `403 expired` | Dashboard → Keys → **+30d** (renew) |
+| `403 device_locked` | Dashboard → Keys → **♻️ Reset device** |
+| `429 rate limit` | Settings me `rate_limit_per_min` badhao (default 120) |
+| Dashboard blank | URL ke aage `/dashboard` lagao; phir bhi na chale to Render logs dekho |
+| Deploy fail | Render → **Logs** tab me error padho; aksar `requirements.txt` ya `PORT` ki wajah se hota hai |
+
 ### ➕ Extra helper endpoints (bonus)
 | Endpoint | Kaam |
 |----------|------|
@@ -319,7 +583,7 @@ Ab jab koi `/api/num-info?key=Demo&q=919973700984` chalega, to response me
 
 | Tab | Kya milta hai |
 |-----|---------------|
-| 🔌 Endpoints | 48 endpoints ki list, search, category filter, live test + response + Copy URL |
+| 🔌 Endpoints | 53 endpoints ki list, search, category filter, live test + response + Copy URL |
 | 🗄️ Database | Records add / search / delete / CSV import / export |
 | 🔑 API Keys | Naya key banao, enable-disable karo, request count dekho |
 | 📊 Logs | Kaunsi API kab chali, source (native/upstream/cache), time, status |
