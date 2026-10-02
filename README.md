@@ -368,3 +368,33 @@ osint_database.db    # SQLite database (runtime me banta hai)
 ```
 
 Happy OSINT-ing! 🚀
+
+---
+
+## 🛡️ Reliability (upstream slow / down hone par bhi API chalu rahe)
+
+| Feature | Kya karta hai |
+|---------|---------------|
+| **Smart cache** | Har successful response SQLite me cache hota hai. Number/leak reports **12 ghante**, vehicle report **6 ghante** cache rehte hain (Settings me `cache_ttl` se global change). |
+| **Stale fallback** | Agar upstream abhi down / rate-limited hai, to purana cached result `X-Source: stale-cache` header ke saath wapas mil jata hai — API kabhi blank nahi jati. |
+| **Auto version fallback** | `vehicle-rc` fail → `vehicle-info` → `vehicle-details` → `vehicle-v`. `terabox-stream-v3` fail → `v2` → `v1` → `file`. GST/PAN versions bhi aapas me fallback hote hain. |
+| **Deadline guard** | `max_request_seconds` (default 50s) — ek request kabhi hang nahi hoti. Settings me badal sakte hain. |
+| **Number variants** | `/api/num-info` 10-digit aur `91...` dono format khud try karta hai. `&deep=1` aur variants try karta hai. |
+
+### Telegram bot me kaise use karein
+Bas `&format=text` lagao — response seedha message me paste karne layak text aa jata hai:
+```
+https://aapka-url.onrender.com/api/num-info?key=Demo&q=919973700984&format=text
+https://aapka-url.onrender.com/api/vehicle-report?key=Demo&number=BR30AR0802&format=text
+```
+
+---
+
+## ⚖️ Responsible use
+
+* Ye API **public / aggregated sources** se data laati hai — isme aapka apna koi government
+  database nahi hai, aur na hi kisi paid service ka paywall todti hai.
+* Jo personal data aata hai (naam, pata, ID) uska istemal sirf **apni verification / safety**
+  ke liye karein. Har report me likha hota hai: *"Verify from a second source"* /
+  *"Confirm once on the official e-Challan / Parivahan site before paying anything."*
+* Challan payment hamesha **sarkari site** (Parivahan / echallan) par confirm kar ke hi karein.

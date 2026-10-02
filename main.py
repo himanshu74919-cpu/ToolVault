@@ -129,6 +129,7 @@ def init_db():
         "cache_ttl": "3600",
         "cache_enabled": "1",
         "rate_limit_per_min": "120",
+        "max_request_seconds": "50",
         "admin_password": ADMIN_PASSWORD,
         "github_token": GITHUB_TOKEN,
     }
@@ -394,7 +395,7 @@ RTO_DISTRICTS = {
     "BR17": "Gopalganj", "BR18": "Siwan", "BR19": "Sitamarhi", "BR20": "Vaishali (Hajipur)",
     "BR21": "Samastipur", "BR22": "Begusarai", "BR23": "Khagaria", "BR24": "Madhubani",
     "BR25": "Madhepura", "BR26": "Supaul", "BR27": "Araria", "BR28": "Kishanganj",
-    "BR29": "Katihar", "BR30": "Banka", "BR31": "Sheohar", "BR32": "Sheikhpura",
+    "BR29": "Katihar", "BR30": "Sitamarhi", "BR31": "Sheohar", "BR32": "Sheikhpura",
     "BR33": "Lakhisarai", "BR34": "Jamui", "BR35": "Buxar", "BR36": "Bhabua (Kaimur)",
     "BR37": "Arwal", "BR38": "Patna (City)", "BR39": "Muzaffarpur (City)",
     "BR40": "Gaya (City)", "BR41": "Bhagalpur (City)", "BR42": "Darbhanga (City)",
@@ -1337,8 +1338,8 @@ def merge_people(records: List[Tuple[Dict[str, Any], str]], query_phone: str = "
     index: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for rec, source in records:
         person = _person_from_record(rec, source)
-        if not person["name"] and not person["phones"] and not person["addresses"]:
-            continue
+        if not person["name"] and not person["father_name"] and not person["addresses"]:
+            continue  # unnamed / empty rows are not useful in a report
         key = (person["name"].lower(), person["father_name"].lower())
         if key in index:
             cur = index[key]
@@ -1525,10 +1526,13 @@ async def native_num_info_full(params: Dict[str, Any], request: Request) -> Tupl
                     sources.append(f"own-db:{category}")
 
     # 2) upstream sources
+    deadline = float(get_setting("max_request_seconds", "50") or 50)
     for variant in variants:
         for source_path in ("num-info", "leak-v1", "leak-v2"):
+            if time.time() - started > deadline:
+                break
             tried.append(f"{source_path}:{variant}")
-            data, _ = await upstream_call(source_path, {"q": variant}, timeout=60, retries=0)
+            data, _ = await upstream_call(source_path, {"q": variant}, timeout=35, retries=0)
             if data is None:
                 continue
             records = _norm_records(data)
@@ -1581,12 +1585,19 @@ async def native_vehicle_report(params: Dict[str, Any], request: Request) -> Tup
     challan_payload: Optional[Dict[str, Any]] = None
     summary_payload: Optional[Dict[str, Any]] = None
 
+    deadline = float(get_setting("max_request_seconds", "50") or 50)
+
+    def out_of_time() -> bool:
+        return (time.time() - started) > deadline
+
     # 1) RC details (main source)
-    rc_payload, _ = await upstream_call("vehicle-rc", {"number": number}, timeout=60, retries=1)
+    rc_payload, _ = await upstream_call("vehicle-rc", {"number": number}, timeout=35, retries=0)
     if rc_payload is None:
         for fb in ("vehicle-info", "vehicle-details", "vehicle-v"):
+            if out_of_time():
+                break
             rc_payload, _ = await upstream_call(fb, {"number": number, "rc": number,
-                                                     "vehicle_number": number}, timeout=60, retries=0)
+                                                     "vehicle_number": number}, timeout=30, retries=0)
             if rc_payload is not None:
                 sources.append(fb)
                 break
@@ -1596,21 +1607,25 @@ async def native_vehicle_report(params: Dict[str, Any], request: Request) -> Tup
         rc_payload = None
 
     # 2) Extra make/model data
-    if not rc_payload or not (rc_payload.get("data") or {}).get("vehicle_info"):
+    if (not rc_payload or not (rc_payload.get("data") or {}).get("vehicle_info")) and not out_of_time():
         info_payload, _ = await upstream_call("vehicle-info", {"vehicle_number": number},
-                                              timeout=45, retries=0)
+                                              timeout=25, retries=0)
         if isinstance(info_payload, dict) and not info_payload.get("errorMsg"):
             sources.append("vehicle-info")
         else:
             info_payload = None
 
     # 3) Challans (detailed list + summary)
-    challan_payload, _ = await upstream_call("vehicle-challan", {"number": number}, timeout=60, retries=0)
+    if not out_of_time():
+        challan_payload, _ = await upstream_call("vehicle-challan", {"number": number},
+                                                 timeout=30, retries=0)
     if isinstance(challan_payload, dict) and (challan_payload.get("data") or {}).get("challan_details"):
         sources.append("vehicle-challan")
     else:
         challan_payload = None
-    summary_payload, _ = await upstream_call("vehicle-challan-v4", {"number": number}, timeout=60, retries=0)
+    if not out_of_time():
+        summary_payload, _ = await upstream_call("vehicle-challan-v4", {"number": number},
+                                                 timeout=30, retries=0)
     if isinstance(summary_payload, dict) and (summary_payload.get("data") or {}).get("challan_summary"):
         sources.append("vehicle-challan-v4")
     else:
@@ -1650,10 +1665,15 @@ async def native_vehicle_report(params: Dict[str, Any], request: Request) -> Tup
         "noc": other.get("NOC Details") or "NA",
         "permit_type": other.get("Permit Type") or "NA",
     }
+    local_rto_label = ""
+    if local.get("rto_office") and local.get("state"):
+        local_rto_label = f"{local['rto_office']}, {local['state']}".upper() + " (approx, local map)"
+    elif local.get("state"):
+        local_rto_label = f"{local['state']}".upper() + " (approx, local map)"
     rto = {
-        "registered_rto": own_sec.get("Registered RTO") or local.get("rto_office") or "NA",
+        "registered_rto": own_sec.get("Registered RTO") or local_rto_label or "NA",
         "code": vinfo.get("code") or local.get("rto_code") or "NA",
-        "city_name": vinfo.get("city_name") or local.get("rto_office") or "NA",
+        "city_name": vinfo.get("city_name") or (local.get("rto_office") or "NA"),
         "address": vinfo.get("address") or "NA",
         "phone": vinfo.get("phone") or "NA",
         "website": vinfo.get("website") or "NA",
@@ -1897,23 +1917,23 @@ ENDPOINTS: List[Dict[str, Any]] = [
 
     # ---------- Leak OSINT ----------
     dict(path="leak-v1", name="Leak OSINT V1", icon="🔥", category="Leak OSINT", native="leak",
-         mode="upstream", params=[P("q", "919973700987")], db_category="leak",
+         mode="upstream", params=[P("q", "919973700987")], db_category="leak", cache_ttl=43200,
          desc="Search leaked / breach databases by phone, email or name."),
     dict(path="leak-v2", name="Leak OSINT V2", icon="🔥", category="Leak OSINT", native="leak",
-         mode="upstream", params=[P("q", "919973700987")], db_category="leak",
+         mode="upstream", params=[P("q", "919973700987")], db_category="leak", cache_ttl=43200,
          desc="Leak OSINT search, version 2."),
     dict(path="num-info", name="Number Info (Full Report)", icon="📞", category="Leak OSINT",
-         native="num_info_full", mode="native", timeout=70,
+         native="num_info_full", mode="native", timeout=70, cache_ttl=43200,
          params=[P("q", "919973700984")],
          desc="⭐ Own number API: name, father, all phone/alt numbers, region, govt ID, addresses "
               "(own DB + num-info + leak-v1/v2, merged). Add &format=text for the card message, "
               "&deep=1 to try more number variants, &raw=1 for raw upstream payloads."),
     dict(path="number-info", name="Number Info (alias)", icon="📞", category="Leak OSINT",
-         native="num_info_full", mode="native", timeout=70,
+         native="num_info_full", mode="native", timeout=70, cache_ttl=43200,
          params=[P("q", "9058390341")],
          desc="Same as /api/num-info (alias for older bots)."),
     dict(path="num", name="Number (short alias)", icon="☎️", category="Leak OSINT",
-         native="num_info_full", mode="native", timeout=70,
+         native="num_info_full", mode="native", timeout=70, cache_ttl=43200,
          params=[P("q", "9058390341")],
          desc="Short alias of /api/num-info."),
 
@@ -1948,16 +1968,16 @@ ENDPOINTS: List[Dict[str, Any]] = [
 
     # ---------- Own report APIs (aggregated) ----------
     dict(path="vehicle-report", name="Vehicle Report (RC + Challan)", icon="🚘", category="Vehicle",
-         native="vehicle_report", mode="native", timeout=90,
+         native="vehicle_report", mode="native", timeout=90, cache_ttl=21600,
          params=[P("number", "BR30AR0802")],
          desc="⭐ Own vehicle API by number plate: maker/model, class, fuel, owner, RTO, RC dates, "
               "insurance, PUC and full challan list. Add &format=text for the ready-to-share card."),
     dict(path="vehicle-full", name="Vehicle Report (alias)", icon="🚘", category="Vehicle",
-         native="vehicle_report", mode="native", timeout=90,
+         native="vehicle_report", mode="native", timeout=90, cache_ttl=21600,
          params=[P("number", "MH12DE1433")],
          desc="Alias of /api/vehicle-report."),
     dict(path="rc-info", name="RC Info (alias)", icon="📄", category="Vehicle",
-         native="vehicle_report", mode="native", timeout=90,
+         native="vehicle_report", mode="native", timeout=90, cache_ttl=21600,
          params=[P("rc", "BR30AR0802")],
          desc="RC details by registration number (alias of /api/vehicle-report)."),
 ]
@@ -2077,13 +2097,19 @@ async def run_endpoint(request: Request, ep: Dict[str, Any]) -> JSONResponse:
     # --- cache ---
     nocache = request.query_params.get("nocache") in ("1", "true", "yes")
     cache_key = f"{ep['path']}?" + urllib_safe(params)
-    ttl = int(get_setting("cache_ttl", "3600") or 0)
+    ttl = int(ep.get("cache_ttl") or get_setting("cache_ttl", "3600") or 0)
     if not nocache and get_setting("cache_enabled", "1") == "1":
         cached = cache_get(cache_key, ttl)
         if cached is not None:
             ms = int((time.time() - started) * 1000)
+            cached = mark(cached, "cache", ep)
+            fmt_c = (request.query_params.get("format") or "").lower()
+            if fmt_c in ("text", "txt", "card", "plain") and isinstance(cached, dict) \
+                    and cached.get("formatted"):
+                log_request(ep["path"], key_used, params, "cache+text", 200, ms, client_ip(request))
+                return PlainTextResponse(cached["formatted"])
             log_request(ep["path"], key_used, params, "cache", 200, ms, client_ip(request))
-            return JSONResponse(mark(cached, "cache", ep), headers={"X-Source": "cache"})
+            return JSONResponse(cached, headers={"X-Source": "cache"})
 
     native_fn_key = ep.get("native")
     native_fn = NATIVE_FUNCS.get(native_fn_key) if native_fn_key else None
@@ -2179,6 +2205,16 @@ async def run_endpoint(request: Request, ep: Dict[str, Any]) -> JSONResponse:
                            "custom_database_records": custom,
                            "custom_database_count": len(custom)}
                 source = "local-database"
+
+    # --- last resort: serve an older cached copy (upstream down / rate limited) ---
+    if payload is None and not nocache:
+        stale = cache_get(cache_key, 7 * 24 * 3600)
+        if stale is not None:
+            stale = mark(stale, "stale-cache", ep)
+            ms = int((time.time() - started) * 1000)
+            log_request(ep["path"], key_used, params, "stale-cache", 200, ms, client_ip(request))
+            return JSONResponse(stale, headers={"X-Source": "stale-cache",
+                                                "X-Response-Time": f"{ms}ms"})
 
     if payload is None:
         ms = int((time.time() - started) * 1000)
@@ -2497,7 +2533,8 @@ async def admin_logs(request: Request, limit: int = 200):
 async def admin_get_settings(request: Request):
     require_admin(request)
     keys = ["upstream_base", "upstream_key", "upstream_enabled", "demo_key_enabled",
-            "cache_ttl", "cache_enabled", "rate_limit_per_min", "github_token"]
+            "cache_ttl", "cache_enabled", "rate_limit_per_min", "github_token",
+            "max_request_seconds"]
     return {"success": True, "settings": {k: get_setting(k, "") for k in keys}}
 
 
@@ -2508,7 +2545,7 @@ async def admin_save_settings(request: Request, payload: Dict[str, Any] = Body(d
     for k, v in data.items():
         if k in ("upstream_base", "upstream_key", "upstream_enabled", "demo_key_enabled",
                  "cache_ttl", "cache_enabled", "rate_limit_per_min", "github_token",
-                 "admin_password"):
+                 "max_request_seconds", "admin_password"):
             set_setting(k, str(v))
     return {"success": True}
 
@@ -2800,7 +2837,10 @@ a{color:#79c0ff}
       <div><label>Rate limit (requests / minute / key)</label><input id="stRate" type="number"></div>
       <div><label>GitHub token (optional)</label><input id="stGithub"></div>
     </div>
-    <div class="row"><div><label>New admin password</label><input id="stAdmin" placeholder="change karne ke liye likho"></div></div>
+    <div class="row">
+      <div><label>Max seconds per request (slow upstream ke liye)</label><input id="stMaxSec" type="number"></div>
+      <div><label>New admin password</label><input id="stAdmin" placeholder="change karne ke liye likho"></div>
+    </div>
     <button class="action" onclick="saveSettings()">Save Settings</button>
     <button class="ghost" onclick="clearCache()">🧹 Clear Cache</button>
   </div>
@@ -3058,6 +3098,7 @@ async function loadSettings(){
     document.getElementById('stCache').value=s.cache_enabled||'1';
     document.getElementById('stRate').value=s.rate_limit_per_min||'120';
     document.getElementById('stGithub').value=s.github_token||'';
+    document.getElementById('stMaxSec').value=s.max_request_seconds||'50';
   }catch(e){}
 }
 async function saveSettings(){
@@ -3069,7 +3110,8 @@ async function saveSettings(){
     cache_ttl: document.getElementById('stTtl').value,
     cache_enabled: document.getElementById('stCache').value,
     rate_limit_per_min: document.getElementById('stRate').value,
-    github_token: document.getElementById('stGithub').value
+    github_token: document.getElementById('stGithub').value,
+    max_request_seconds: document.getElementById('stMaxSec').value
   };
   const admin = document.getElementById('stAdmin').value;
   if(admin){ settings.admin_password = admin; TOKEN = admin; localStorage.setItem('osint_admin', admin);
