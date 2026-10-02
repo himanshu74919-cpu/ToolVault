@@ -2205,7 +2205,7 @@ def format_aadhaar_card(payload: Dict[str, Any]) -> str:
     """Bot-ke-liye ready Hinglish card."""
     loc = payload.get("location") or {}
     members = payload.get("members") or []
-    city = (loc.get("city") or "NA").upper()
+    city = (loc.get("city") or loc.get("district") or loc.get("town") or "NA").upper()
     state = (loc.get("state") or "NA").upper()
     lines = [
         "╔══════════════════════════════════════╗",
@@ -2238,6 +2238,178 @@ def format_aadhaar_card(payload: Dict[str, Any]) -> str:
     ]
     return "\n".join(lines)
 
+
+
+async def native_aadhaar_family(params: Dict[str, Any], request: Request) -> Tuple[Optional[Dict], bool]:
+    """12-digit Aadhaar/UID daalo → us parivar ke members + location."""
+    started = time.time()
+    raw = (params.get("aadhaar") or params.get("uid") or params.get("q")
+           or params.get("ration") or "").strip()
+    aadhaar = re.sub(r"\D", "", raw)
+    if len(aadhaar) != 12:
+        return {"success": False, "error": "Aadhaar must be exactly 12 digits.",
+                "input": raw,
+                "formatted": ("╔══════════════════════════════════════╗\n"
+                              "║       📜 AADHAAR FAMILY INTEL        ║\n"
+                              "╚══════════════════════════════════════╝\n\n"
+                              "❌ 12 digit ka Aadhaar number daalo. Example: /api/aadhaar-family?key=Demo&aadhaar=861313813129"),
+                "_no_cache": True}, True
+
+    deadline = float(get_setting("max_request_seconds", "50") or 50)
+    records: List[Tuple[Dict[str, Any], str]] = []
+    sources: List[str] = []
+
+    # 1) own database (ration / aadhaar records aap khud daal sakte ho)
+    for category in ("aadhaar", "ration", "leak", "general"):
+        for rec in custom_lookup(category, aadhaar):
+            records.append((rec, f"own-db:{category}"))
+            if f"own-db:{category}" not in sources:
+                sources.append(f"own-db:{category}")
+
+    # 2) upstream leak / number databases (Aadhaar document number se search)
+    if not records or str(params.get("deep", "1")).lower() in ("1", "true", "yes"):
+        recs, used = await _collect_leak_records(aadhaar, sources=("num-info", "leak-v1", "leak-v2"),
+                                                 timeout=30, deadline_seconds=deadline * 0.55)
+        records.extend(recs)
+        sources.extend([s for s in used if s not in sources])
+
+    people = merge_people(records, "")
+    if not people:
+        return {"success": False, "query": aadhaar, "aadhaar_masked": mask_aadhaar(aadhaar),
+                "record_count": 0, "members": [],
+                "error": "Is Aadhaar number ke liye koi record nahi mila.",
+                "sources_used": sources,
+                "formatted": ("╔══════════════════════════════════════╗\n"
+                              "║       📜 AADHAAR FAMILY INTEL        ║\n"
+                              "╚══════════════════════════════════════╝\n\n"
+                              f"💳 Aadhaar: {mask_aadhaar(aadhaar)}\n\n"
+                              "❌ Koi record nahi mila.\n"
+                              "💡 Dashboard → Database me apna ration/aadhaar data add kar sakte ho "
+                              "(category: aadhaar/ration)."),
+                "_no_cache": True}, True
+
+    primary = people[0]
+    p_tokens: set = set()
+    for addr in primary.get("addresses") or []:
+        p_tokens |= addr_tokens(addr)
+    p_father = (primary.get("father_name") or "").lower()
+    p_name = (primary.get("name") or "").lower()
+
+    # 3) family expansion (same father / same address / locality words)
+    expanded: List[Tuple[Dict[str, Any], str]] = []
+    deep = str(params.get("deep", "1")).lower() in ("1", "true", "yes")
+    if deep:
+        terms: List[str] = []
+        if len(p_father) >= 8 and " s/o" not in p_father:
+            terms.append(primary["father_name"])
+        terms.extend(locality_terms(primary, limit=3))
+        # ghar ke phone numbers se bhi search - aksar poora parivar mil jata hai
+        for ph in (primary.get("phones") or [])[:2]:
+            if ph and ph not in terms:
+                terms.append(ph)
+        terms = list(dict.fromkeys([t for t in terms if t]))[:5]
+
+        left = deadline - (time.time() - started)
+        if left > 6 and terms:
+            per = int(min(25, max(6, (left * 0.8) / len(terms))))
+            results = await asyncio.gather(*[
+                _collect_leak_records(
+                    t,
+                    sources=("num-info", "leak-v1") if str(t).isdigit() else ("leak-v1",),
+                    timeout=per, deadline_seconds=left * 0.9)
+                for t in terms], return_exceptions=True)
+            for res in results:
+                if isinstance(res, BaseException):
+                    continue
+                recs, used = res
+                expanded.extend(recs)
+                sources.extend([u for u in used if u not in sources])
+
+    all_people = merge_people(records + expanded, "")
+    members: List[Dict[str, Any]] = []
+    for person in all_people:
+        name = (person.get("name") or "").lower()
+        father = (person.get("father_name") or "").lower()
+        tokens: set = set()
+        for addr in person.get("addresses") or []:
+            tokens |= addr_tokens(addr)
+        shared = p_tokens & tokens
+        same_father = bool(p_father and father == p_father)
+        is_child = bool(p_name and father == p_name)
+        same_person = (name == p_name and father == p_father)
+        if not same_person and (len(shared) >= 2 or (same_father and len(shared) >= 1)
+                                or (is_child and len(shared) >= 1)):
+            if not name and len(shared) < 3:
+                continue
+            rel = ("child / dependent" if is_child else
+                   "possible sibling (same father)" if same_father else
+                   "same address / locality")
+            members.append({
+                "name": _title_name(person.get("name") or "") or _no_name_label(person),
+                "aadhaar_masked": mask_aadhaar((person.get("govt_ids") or [""])[0]),
+                "relation": rel,
+                "father_name": person.get("father_name") or "",
+                "phones": person.get("phones") or [],
+                "address": (person.get("addresses") or [""])[0],
+                "match_score": len(shared) + (3 if same_father else 0),
+            })
+    members.sort(key=lambda m: -m.get("match_score", 0))
+
+    # always keep the searched person on top
+    members = [{
+        "name": _title_name(primary.get("name") or "") or "Name not in source",
+        "aadhaar_masked": mask_aadhaar(aadhaar),
+        "relation": "searched Aadhaar holder",
+        "father_name": primary.get("father_name") or "",
+        "phones": primary.get("phones") or [],
+        "address": (primary.get("addresses") or [""])[0],
+        "match_score": 999,
+    }] + members[:12]
+
+    # head of family: jo naam sabse zyado ke father field me aaye
+    father_counts: Dict[str, int] = {}
+    for m in members:
+        f = (m.get("father_name") or "").strip().lower()
+        if f:
+            father_counts[f] = father_counts.get(f, 0) + 1
+    head_name = ""
+    if father_counts:
+        head_name = max(father_counts.items(), key=lambda kv: kv[1])[0]
+    for m in members:
+        m["is_head"] = bool(head_name and (m.get("name") or "").strip().lower() == head_name)
+
+    location = parse_location((primary.get("addresses") or [""])[0])
+    ration_card = "NA"
+    fps_id = "NA"
+    for m in members:
+        pass
+    for rec, src in records:
+        for key in ("ration_card", "ration_card_number", "rc_number", "ration"):
+            if rec.get(key):
+                ration_card = str(rec[key])
+        for key in ("fps_id", "fps", "fps_code", "shop_id"):
+            if rec.get(key):
+                fps_id = str(rec[key])
+
+    payload = {
+        "success": True,
+        "aadhaar_masked": mask_aadhaar(aadhaar),
+        "aadhaar_valid_checksum": verhoeff_valid(aadhaar),
+        "ration_card_number": ration_card,
+        "fps_id": fps_id,
+        "primary": primary,
+        "members": members,
+        "member_count": len(members),
+        "location": location,
+        "sources_used": sources,
+        "response_time": f"{round(time.time() - started, 2)}s",
+        "timestamp_ist": now_ist("%d-%m-%Y %H:%M:%S"),
+        "note": ("Aadhaar numbers hamesha MASKED hote hain (sirf last 4 digit). "
+                 "Ration card / FPS ID tabhi aata hai jab source me ho "
+                 "(apna data Database tab se add kar sakte ho)."),
+    }
+    payload["formatted"] = format_aadhaar_card(payload)
+    return payload, False
 
 def _invidious_instance_list() -> List[str]:
     """Public Invidious instance list (30 min cache) + hardcoded backup."""
