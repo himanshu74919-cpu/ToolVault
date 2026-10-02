@@ -19,6 +19,7 @@ Commands:
   /key                     -> apni key ki expiry/plan
 """
 
+import re
 import time
 
 import requests
@@ -30,13 +31,17 @@ API_KEY = "Demo"
 # =================================================
 
 HELP_TEXT = """🤖 *OSINT API Bot*
+_Powered by @Supermannn_x_
 
 Commands:
 /num <number> — Number report (naam, father, address, ID)
 /vehicle <plate> — RC + insurance + challan report
 /family <number> — Family / linked numbers
+/aadhaar <12 digits> — Aadhaar family intel (members + district)
 /email <email> — Email OSINT + leak records
 /pass <password> — Password breach check
+/yt <youtube link> — Direct download links
+/ytmp3 <youtube link> — Sirf audio link
 /key — Apni API key ki expiry/plan
 
 Example: `/num 919973700984`"""
@@ -94,6 +99,18 @@ def handle(text: str) -> str:
         if not arg:
             return "Usage: `/family 919973700984`"
         return api_get("family", q=arg)
+    if cmd == "/aadhaar":
+        if not arg or len(re.sub(r"\D", "", arg)) != 12:
+            return "Usage: `/aadhaar 861313813129`  (12 digit)"
+        return api_get("aadhaar-family", aadhaar=re.sub(r"\D", "", arg))
+    if cmd in ("/yt", "/youtube"):
+        if not arg:
+            return "Usage: `/yt https://youtube.com/watch?v=XXXX`"
+        return api_get("youtube-download", url=arg)
+    if cmd == "/ytmp3":
+        if not arg:
+            return "Usage: `/ytmp3 https://youtube.com/watch?v=XXXX`"
+        return api_get("youtube-mp3", url=arg)
     if cmd == "/email":
         if not arg:
             return "Usage: `/email test@gmail.com`"

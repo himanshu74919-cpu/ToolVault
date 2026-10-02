@@ -42,6 +42,7 @@ APP_VERSION = "2.0.0"
 DB_PATH = os.environ.get("DB_PATH", "osint_database.db")
 PORT = int(os.environ.get("PORT", "8000"))
 
+DEFAULT_BRAND = os.environ.get("BRAND_TAG", "@Supermannn_x")
 DEFAULT_UPSTREAM = os.environ.get("UPSTREAM_BASE", "https://osint-apis-hub.onrender.com")
 DEFAULT_UPSTREAM_KEY = os.environ.get("UPSTREAM_KEY", "Demo")
 DEMO_KEY = os.environ.get("DEMO_KEY", "Demo")
@@ -140,6 +141,7 @@ def init_db():
         "cache_enabled": "1",
         "rate_limit_per_min": "120",
         "max_request_seconds": "50",
+        "brand_tag": DEFAULT_BRAND,
         "admin_password": ADMIN_PASSWORD,
         "github_token": GITHUB_TOKEN,
     }
@@ -201,6 +203,37 @@ def set_setting(key: str, value: str):
 
 def now_ist(fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
     return datetime.now(IST).strftime(fmt)
+
+
+# =====================================================================
+# BRANDING  (har response me "Powered by @Supermannn_x")
+# =====================================================================
+def brand() -> str:
+    return (get_setting("brand_tag", DEFAULT_BRAND) or DEFAULT_BRAND).strip()
+
+
+def brand_line() -> str:
+    return f"⚡ Powered by {brand()}  |  API Developer / Telegram: {brand()}"
+
+
+def add_brand(text: Optional[str]) -> Optional[str]:
+    """Append the credit footer to any formatted text card (only once)."""
+    if not text or not isinstance(text, str):
+        return text
+    tag = brand()
+    if tag and tag not in text:
+        return text.rstrip() + f"\n\n{brand_line()}"
+    return text
+
+
+def apply_brand(payload: Any) -> Any:
+    """Add branding to a response payload (dict) - both JSON meta and text card."""
+    if isinstance(payload, dict):
+        if isinstance(payload.get("formatted"), str):
+            payload["formatted"] = add_brand(payload["formatted"])
+        if "powered_by" not in payload:
+            payload["powered_by"] = brand()
+    return payload
 
 
 def log_request(endpoint: str, api_key: str, params: Dict[str, Any], source: str,
@@ -1995,6 +2028,447 @@ async def native_pass_check(params: Dict[str, Any], request: Request) -> Tuple[O
     }, False
 
 
+# ---------------------------------------------------------------------
+# AADHAAR FAMILY INTEL
+# ---------------------------------------------------------------------
+VERHOEFF_D = [
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+    [1, 2, 3, 4, 0, 6, 7, 8, 9, 5],
+    [2, 3, 4, 0, 1, 7, 8, 9, 5, 6],
+    [3, 4, 0, 1, 2, 8, 9, 5, 6, 7],
+    [4, 0, 1, 2, 3, 9, 5, 6, 7, 8],
+    [5, 9, 8, 7, 6, 0, 4, 3, 2, 1],
+    [6, 5, 9, 8, 7, 1, 0, 4, 3, 2],
+    [7, 6, 5, 9, 8, 2, 1, 0, 4, 3],
+    [8, 7, 6, 5, 9, 3, 2, 1, 0, 4],
+    [9, 8, 7, 6, 5, 4, 3, 2, 1, 0],
+]
+VERHOEFF_P = [
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+    [1, 5, 7, 6, 2, 8, 3, 0, 9, 4],
+    [5, 8, 0, 3, 7, 9, 6, 1, 4, 2],
+    [8, 9, 1, 6, 0, 4, 3, 5, 2, 7],
+    [9, 4, 5, 3, 1, 2, 6, 8, 7, 0],
+    [4, 2, 8, 6, 5, 7, 3, 9, 0, 1],
+    [2, 7, 9, 3, 8, 0, 6, 4, 1, 5],
+    [7, 0, 4, 6, 9, 1, 3, 2, 5, 8],
+]
+
+
+def verhoeff_valid(number: str) -> bool:
+    if not number.isdigit():
+        return False
+    c = 0
+    for i, ch in enumerate(reversed(number)):
+        c = VERHOEFF_D[c][VERHOEFF_P[i % 8][int(ch)]]
+    return c == 0
+
+
+def mask_aadhaar(value: Any) -> str:
+    digits = re.sub(r"\D", "", str(value or ""))
+    if len(digits) < 4:
+        return "XXXXXXXX" + digits
+    return "XXXXXXXX" + digits[-4:]
+
+
+INDIAN_STATES = [
+    "Andhra Pradesh", "Arunachal Pradesh", "Assam", "Bihar", "Chhattisgarh", "Goa", "Gujarat",
+    "Haryana", "Himachal Pradesh", "Jharkhand", "Karnataka", "Kerala", "Madhya Pradesh",
+    "Maharashtra", "Manipur", "Meghalaya", "Mizoram", "Nagaland", "Odisha", "Punjab",
+    "Rajasthan", "Sikkim", "Tamil Nadu", "Telangana", "Tripura", "Uttar Pradesh",
+    "Uttarakhand", "West Bengal", "Jammu and Kashmir", "Jammu & Kashmir", "Ladakh",
+    "Delhi", "Puducherry", "Chandigarh", "Andaman and Nicobar Islands",
+    "Dadra and Nagar Haveli and Daman and Diu", "Lakshadweep",
+]
+
+
+def parse_location(address: str) -> Dict[str, str]:
+    addr = (address or "")
+    low = addr.lower()
+    state = ""
+    for st in INDIAN_STATES:
+        if st.lower() in low:
+            state = st.upper()
+            break
+    district = ""
+    parts = [p.strip() for p in re.split(r"[,]", addr) if p.strip()]
+    for i, part in enumerate(parts):
+        if state and state.lower() in part.lower():
+            prev = parts[i - 1] if i > 0 else ""
+            prev = re.sub(r"\b\d{6}\b", "", prev).strip(" .,-")
+            if prev and not prev.isdigit():
+                district = prev.upper()
+            break
+    if not district:
+        for part in reversed(parts):
+            clean = re.sub(r"\b\d{6}\b", "", part).strip(" .,-")
+            if clean and not clean.isdigit() and len(clean) > 3 and (
+                    not state or state.lower() not in clean.lower()):
+                district = clean.upper()
+                break
+    return {"district": district, "state": state, "pincode": (re.findall(r"\b\d{6}\b", addr) or [""])[0]}
+
+
+def format_aadhaar_card(data: Dict[str, Any]) -> str:
+    lines = ["╔══════════════════════════════════════╗",
+             "║       📜 AADHAAR FAMILY INTEL        ║",
+             "╚══════════════════════════════════════╝", ""]
+    lines.append("💳 Aadhaar Number (searched)")
+    lines.append(f"┗ 🎫 {data.get('aadhaar_masked', 'NA')}")
+    lines.append("")
+    if data.get("ration_card_number") or data.get("fps_id"):
+        lines.append("📊 Card Details")
+        if data.get("ration_card_number") and data["ration_card_number"] != "NA":
+            lines.append(f"┗ 🎫 Ration Card: {data['ration_card_number']}")
+        if data.get("fps_id") and data["fps_id"] != "NA":
+            lines.append(f"┗ 🏪 FPS ID: {data['fps_id']}")
+        lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("")
+    members = data.get("members") or []
+    lines.append(f"👨‍👩‍👧‍👦 FAMILY MEMBERS ({len(members)})")
+    for idx, m in enumerate(members, 1):
+        head = " 👑 (Head)" if m.get("is_head") else ""
+        lines.append(f"👤 {idx}. {m.get('name') or 'Unknown'}{head}")
+        lines.append(f" ┗ 💳 Aadhaar: {m.get('aadhaar_masked', 'XXXXXXXX')}")
+        if m.get("relation") and not m.get("is_head"):
+            lines.append(f" ┗ 🔗 {m['relation']}")
+        lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("")
+    lines.append("📍 LOCATION DETAILS")
+    loc = data.get("location") or {}
+    lines.append("🗺️ District / State")
+    district_state = " / ".join([x for x in [loc.get("district"), loc.get("state")] if x]) or "NA"
+    lines.append(f"┗ 🏙️ {district_state}")
+    if loc.get("pincode"):
+        lines.append(f"┗ 📮 PIN: {loc['pincode']}")
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    return "\n".join(lines)
+
+
+async def native_aadhaar_family(params: Dict[str, Any], request: Request) -> Tuple[Optional[Dict], bool]:
+    """12-digit Aadhaar/UID daalo → us parivar ke members + location."""
+    started = time.time()
+    raw = (params.get("aadhaar") or params.get("uid") or params.get("q")
+           or params.get("ration") or "").strip()
+    aadhaar = re.sub(r"\D", "", raw)
+    if len(aadhaar) != 12:
+        return {"success": False, "error": "Aadhaar must be exactly 12 digits.",
+                "input": raw,
+                "formatted": ("╔══════════════════════════════════════╗\n"
+                              "║       📜 AADHAAR FAMILY INTEL        ║\n"
+                              "╚══════════════════════════════════════╝\n\n"
+                              "❌ 12 digit ka Aadhaar number daalo. Example: /api/aadhaar-family?key=Demo&aadhaar=861313813129"),
+                "_no_cache": True}, True
+
+    deadline = float(get_setting("max_request_seconds", "50") or 50)
+    records: List[Tuple[Dict[str, Any], str]] = []
+    sources: List[str] = []
+
+    # 1) own database (ration / aadhaar records aap khud daal sakte ho)
+    for category in ("aadhaar", "ration", "leak", "general"):
+        for rec in custom_lookup(category, aadhaar):
+            records.append((rec, f"own-db:{category}"))
+            if f"own-db:{category}" not in sources:
+                sources.append(f"own-db:{category}")
+
+    # 2) upstream leak / number databases (Aadhaar document number se search)
+    if not records or str(params.get("deep", "1")).lower() in ("1", "true", "yes"):
+        recs, used = await _collect_leak_records(aadhaar, sources=("num-info", "leak-v1", "leak-v2"),
+                                                 timeout=30, deadline_seconds=deadline * 0.55)
+        records.extend(recs)
+        sources.extend([s for s in used if s not in sources])
+
+    people = merge_people(records, "")
+    if not people:
+        return {"success": False, "query": aadhaar, "aadhaar_masked": mask_aadhaar(aadhaar),
+                "record_count": 0, "members": [],
+                "error": "Is Aadhaar number ke liye koi record nahi mila.",
+                "sources_used": sources,
+                "formatted": ("╔══════════════════════════════════════╗\n"
+                              "║       📜 AADHAAR FAMILY INTEL        ║\n"
+                              "╚══════════════════════════════════════╝\n\n"
+                              f"💳 Aadhaar: {mask_aadhaar(aadhaar)}\n\n"
+                              "❌ Koi record nahi mila.\n"
+                              "💡 Dashboard → Database me apna ration/aadhaar data add kar sakte ho "
+                              "(category: aadhaar/ration)."),
+                "_no_cache": True}, True
+
+    primary = people[0]
+    p_tokens: set = set()
+    for addr in primary.get("addresses") or []:
+        p_tokens |= addr_tokens(addr)
+    p_father = (primary.get("father_name") or "").lower()
+    p_name = (primary.get("name") or "").lower()
+
+    # 3) family expansion (same father / same address / locality words)
+    expanded: List[Tuple[Dict[str, Any], str]] = []
+    deep = str(params.get("deep", "1")).lower() in ("1", "true", "yes")
+    if deep:
+        terms = []
+        if len(p_father) >= 8 and " s/o" not in p_father:
+            terms.append(primary["father_name"])
+        terms.extend(locality_terms(primary, limit=2))
+        for term in terms[:3]:
+            if time.time() - started > deadline * 0.85:
+                break
+            recs, used = await _collect_leak_records(term, sources=("leak-v1",),
+                                                     timeout=25, deadline_seconds=20)
+            expanded.extend(recs)
+            sources.extend([s for s in used if s not in sources])
+
+    all_people = merge_people(records + expanded, "")
+    members: List[Dict[str, Any]] = []
+    for person in all_people:
+        name = (person.get("name") or "").lower()
+        father = (person.get("father_name") or "").lower()
+        tokens: set = set()
+        for addr in person.get("addresses") or []:
+            tokens |= addr_tokens(addr)
+        shared = p_tokens & tokens
+        same_father = bool(p_father and father == p_father)
+        is_child = bool(p_name and father == p_name)
+        same_person = (name == p_name and father == p_father)
+        if not same_person and (len(shared) >= 2 or (same_father and len(shared) >= 1)
+                                or (is_child and len(shared) >= 1)):
+            if not name and len(shared) < 3:
+                continue
+            rel = ("child / dependent" if is_child else
+                   "possible sibling (same father)" if same_father else
+                   "same address / locality")
+            members.append({
+                "name": _title_name(person.get("name") or "") or "Unknown",
+                "aadhaar_masked": mask_aadhaar((person.get("govt_ids") or [""])[0]),
+                "relation": rel,
+                "father_name": person.get("father_name") or "",
+                "phones": person.get("phones") or [],
+                "address": (person.get("addresses") or [""])[0],
+                "match_score": len(shared) + (3 if same_father else 0),
+            })
+    members.sort(key=lambda m: -m.get("match_score", 0))
+
+    # always keep the searched person on top
+    members = [{
+        "name": _title_name(primary.get("name") or "") or "Unknown",
+        "aadhaar_masked": mask_aadhaar(aadhaar),
+        "relation": "searched Aadhaar holder",
+        "father_name": primary.get("father_name") or "",
+        "phones": primary.get("phones") or [],
+        "address": (primary.get("addresses") or [""])[0],
+        "match_score": 999,
+    }] + members[:12]
+
+    # head of family: jo naam sabse zyado ke father field me aaye
+    father_counts: Dict[str, int] = {}
+    for m in members:
+        f = (m.get("father_name") or "").strip().lower()
+        if f:
+            father_counts[f] = father_counts.get(f, 0) + 1
+    head_name = ""
+    if father_counts:
+        head_name = max(father_counts.items(), key=lambda kv: kv[1])[0]
+    for m in members:
+        m["is_head"] = bool(head_name and (m.get("name") or "").strip().lower() == head_name)
+
+    location = parse_location((primary.get("addresses") or [""])[0])
+    ration_card = "NA"
+    fps_id = "NA"
+    for m in members:
+        pass
+    for rec, src in records:
+        for key in ("ration_card", "ration_card_number", "rc_number", "ration"):
+            if rec.get(key):
+                ration_card = str(rec[key])
+        for key in ("fps_id", "fps", "fps_code", "shop_id"):
+            if rec.get(key):
+                fps_id = str(rec[key])
+
+    payload = {
+        "success": True,
+        "aadhaar_masked": mask_aadhaar(aadhaar),
+        "aadhaar_valid_checksum": verhoeff_valid(aadhaar),
+        "ration_card_number": ration_card,
+        "fps_id": fps_id,
+        "primary": primary,
+        "members": members,
+        "member_count": len(members),
+        "location": location,
+        "sources_used": sources,
+        "response_time": f"{round(time.time() - started, 2)}s",
+        "timestamp_ist": now_ist("%d-%m-%Y %H:%M:%S"),
+        "note": ("Aadhaar numbers hamesha MASKED hote hain (sirf last 4 digit). "
+                 "Ration card / FPS ID tabhi aata hai jab source me ho "
+                 "(apna data Database tab se add kar sakte ho)."),
+    }
+    payload["formatted"] = format_aadhaar_card(payload)
+    return payload, False
+
+
+# ---------------------------------------------------------------------
+# YOUTUBE DOWNLOADER (for Telegram bots)
+# ---------------------------------------------------------------------
+def _yt_extract(url: str, mode: str, quality: str, timeout: int = 40) -> Dict[str, Any]:
+    """Blocking yt-dlp extraction (run inside a thread)."""
+    try:
+        import yt_dlp  # optional dependency
+    except Exception as exc:
+        return {"error": f"yt-dlp installed nahi hai: {exc}"}
+
+    if mode == "audio":
+        fmt = "bestaudio[ext=m4a]/bestaudio/best"
+    elif quality and quality.isdigit():
+        fmt = (f"bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/"
+               f"best[height<={quality}][ext=mp4]/best[ext=mp4]/best")
+    else:
+        fmt = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+
+    opts = {
+        "quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
+        "format": fmt, "socket_timeout": timeout, "nocheckcertificate": True,
+        "source_address": None, "geo_bypass": True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as exc:
+        return {"error": str(exc)[:300]}
+
+    links: List[Dict[str, Any]] = []
+    requested = info.get("requested_formats") or []
+    if requested:
+        for f in requested:
+            links.append({
+                "type": "video" if f.get("vcodec") not in (None, "none") else "audio",
+                "format_id": f.get("format_id"),
+                "ext": f.get("ext"),
+                "quality": f"{f.get('height') or ''}p".replace("p", "p") if f.get("height") else
+                           (str(f.get("abr") or "") + "kbps" if f.get("abr") else "audio"),
+                "filesize": f.get("filesize") or f.get("filesize_approx"),
+                "url": f.get("url"),
+            })
+    elif info.get("url"):
+        links.append({"type": mode if mode in ("video", "audio") else "video",
+                      "format_id": info.get("format_id"), "ext": info.get("ext"),
+                      "quality": f"{info.get('height') or ''}p" if info.get("height") else "best",
+                      "filesize": info.get("filesize") or info.get("filesize_approx"),
+                      "url": info.get("url")})
+    return {
+        "video_id": info.get("id"),
+        "title": info.get("title"),
+        "channel": info.get("channel") or info.get("uploader"),
+        "duration": info.get("duration"),
+        "thumbnail": info.get("thumbnail"),
+        "view_count": info.get("view_count"),
+        "links": links,
+    }
+
+
+async def native_youtube_download(params: Dict[str, Any], request: Request) -> Tuple[Optional[Dict], bool]:
+    """YouTube link → direct download links (Telegram bot ke liye ready)."""
+    started = time.time()
+    url = (params.get("url") or params.get("link") or params.get("q")
+           or params.get("id") or params.get("v") or "").strip()
+    vid = yt_id(url)
+    if not vid:
+        return None, True
+    watch = f"https://www.youtube.com/watch?v={vid}"
+    mode = (params.get("type") or params.get("mode") or "video").lower()
+    if str(params.get("endpoint_hint", "")) == "youtube-mp3":
+        mode = "audio"
+    if mode not in ("video", "audio", "both"):
+        mode = "video"
+    quality = str(params.get("quality") or "").strip()
+
+    result: Dict[str, Any] = {}
+    error = ""
+    deadline = float(get_setting("max_request_seconds", "50") or 50)
+    try:
+        loop = __import__("asyncio").get_event_loop()
+        result = await loop.run_in_executor(
+            None, lambda: _yt_extract(watch, "audio" if mode == "audio" else mode, quality,
+                                      timeout=int(max(20, min(deadline - 5, 40)))))
+    except Exception as exc:
+        error = str(exc)[:200]
+
+    # fallback: upstream download links (agar yt-dlp fail ho ya installed na ho)
+    links = result.get("links") if isinstance(result, dict) else None
+    upstream_links: List[Dict[str, Any]] = []
+    sources: List[str] = []
+    if not links and (time.time() - started) < deadline * 0.8:
+        up, _ = await upstream_call("youtube-all", {"url": watch}, timeout=30, retries=0)
+        if isinstance(up, dict):
+            sources.append("youtube-all")
+            dl = up.get("download_links") or {}
+            for provider, items in dl.items():
+                if isinstance(items, list):
+                    for item in items:
+                        if isinstance(item, dict) and item.get("url"):
+                            upstream_links.append({
+                                "type": "video", "provider": provider,
+                                "quality": item.get("quality") or item.get("format") or "",
+                                "url": item.get("url")})
+            result = {
+                "video_id": up.get("video_id") or vid,
+                "title": ((up.get("video_info") or {}) or {}).get("title"),
+                "channel": ((up.get("channel_info") or {}) or {}).get("title"),
+                "duration": ((up.get("video_info") or {}) or {}).get("lengthSeconds"),
+                "thumbnail": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
+                "links": upstream_links,
+            }
+
+    all_links = (result.get("links") or []) if isinstance(result, dict) else []
+    video_link = next((l for l in all_links if l.get("type") == "video"), None)
+    audio_link = next((l for l in all_links if l.get("type") == "audio"), None)
+
+    lines = ["╔══════════════════════════════════════╗",
+             "║       ▶️ YOUTUBE DOWNLOAD LINKS      ║",
+             "╚══════════════════════════════════════╝", ""]
+    title = (result.get("title") if isinstance(result, dict) else "") or "NA"
+    lines.append(f"🎬 {title[:70]}")
+    if result.get("channel"):
+        lines.append(f"📺 {result['channel'][:60]}")
+    if result.get("duration"):
+        lines.append(f"⏱️ {int(result['duration']) // 60}:{int(result['duration']) % 60:02d}")
+    lines.append("")
+    if all_links:
+        for idx, l in enumerate(all_links[:6], 1):
+            label = "🎥 VIDEO" if l.get("type") == "video" else "🎵 AUDIO"
+            lines.append(f"{label} {idx}: {l.get('quality') or ''} · {l.get('ext') or ''}")
+            lines.append(f"┗ 🔗 {str(l.get('url'))[:200]}")
+        lines.append("")
+        lines.append("⚠️ Ye direct links 2–6 ghante me expire ho jate hain.")
+    else:
+        lines.append("❌ Direct link nahi mil paya.")
+        if error:
+            lines.append(f"Reason: {error[:160]}")
+        lines.append("💡 Server par `yt-dlp` installed hona chahiye (requirements.txt me hai).")
+        lines.append("   Agar YouTube ne server IP block kiya hai to thodi der baad try karein.")
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    return {
+        "success": bool(all_links),
+        "video_id": vid,
+        "url": watch,
+        "title": title,
+        "channel": result.get("channel") if isinstance(result, dict) else None,
+        "duration": result.get("duration") if isinstance(result, dict) else None,
+        "thumbnail": result.get("thumbnail") if isinstance(result, dict) else f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
+        "requested_type": mode,
+        "links": all_links,
+        "download_url": (video_link or audio_link or {}).get("url"),
+        "audio_url": (audio_link or {}).get("url"),
+        "error": error or (result.get("error") if isinstance(result, dict) else None),
+        "sources_used": ["yt-dlp"] if (result.get("links") and not sources) else (sources or ["yt-dlp"]),
+        "response_time": f"{round(time.time() - started, 2)}s",
+        "timestamp_ist": now_ist("%d-%m-%Y %H:%M:%S"),
+        "note": "Direct links expire ho jate hain ~2-6 ghante me; Telegram bot me turant use karein.",
+        "formatted": "\n".join(lines),
+    }, not bool(all_links)
+
+
 async def native_num_info_full(params: Dict[str, Any], request: Request) -> Tuple[Optional[Dict], bool]:
     """Own number-intelligence API: local DB + num-info + leak-v1/v2, merged & formatted."""
     started = time.time()
@@ -2280,6 +2754,8 @@ NATIVE_FUNCS: Dict[str, Callable[..., Awaitable[Tuple[Optional[Dict], bool]]]] =
     "family": native_family,
     "email_info": native_email_info,
     "pass_check": native_pass_check,
+    "aadhaar_family": native_aadhaar_family,
+    "youtube_download": native_youtube_download,
 }
 for _kind in ("challan", "challan-v2", "challan-v4", "info", "info-v2", "rc", "details", "v"):
     NATIVE_FUNCS[f"vehicle_{_kind.replace('-', '_')}"] = None  # filled after loop (await below)
@@ -2503,6 +2979,34 @@ ENDPOINTS: List[Dict[str, Any]] = [
          params=[P("password", "Katihar@123")],
          desc="Password kisi breach me hai ya nahi (Pwned Passwords k-anonymity - password server "
               "se bahar nahi jata)."),
+
+    # ---------- Aadhaar family + YouTube downloader ----------
+    dict(path="aadhaar-family", name="Aadhaar Family Intel", icon="📜", category="Aadhaar",
+         native="aadhaar_family", mode="native", timeout=70, cache_ttl=43200,
+         params=[P("aadhaar", "861313813129")],
+         desc="⭐ 12-digit Aadhaar/UID daalo → parivar ke members (masked Aadhaar, head of family "
+              "crown, relation) + district/state. &format=text se ready card."),
+    dict(path="aadhaar", name="Aadhaar Family (alias)", icon="📜", category="Aadhaar",
+         native="aadhaar_family", mode="native", timeout=70, cache_ttl=43200,
+         params=[P("aadhaar", "300664932743")],
+         desc="Alias of /api/aadhaar-family."),
+    dict(path="ration", name="Ration / Family (alias)", icon="🎫", category="Aadhaar",
+         native="aadhaar_family", mode="native", timeout=70, cache_ttl=43200,
+         params=[P("q", "861313813129")],
+         desc="Alias of /api/aadhaar-family (ration card number se bhi try karein)."),
+    dict(path="youtube-download", name="YouTube Downloader", icon="⬇️", category="YouTube",
+         native="youtube_download", mode="native", timeout=70, cache_ttl=3600,
+         params=[P("url", "https://youtube.com/watch?v=X8X-XyK4CYE")],
+         desc="⭐ YouTube link daalo → direct video/audio download links (Telegram bot me direct "
+              "bhejne layak). &type=audio (mp3/m4a), &quality=720, &format=text se card."),
+    dict(path="ytdl", name="YouTube Download (alias)", icon="⬇️", category="YouTube",
+         native="youtube_download", mode="native", timeout=70, cache_ttl=3600,
+         params=[P("url", "https://youtube.com/watch?v=X8X-XyK4CYE")],
+         desc="Alias of /api/youtube-download."),
+    dict(path="youtube-mp3", name="YouTube Audio (MP3/M4A)", icon="🎵", category="YouTube",
+         native="youtube_download", mode="native", timeout=70, cache_ttl=3600,
+         params=[P("url", "https://youtube.com/watch?v=X8X-XyK4CYE")],
+         desc="Same as youtube-download with type=audio (sirf audio link)."),
 ]
 
 ENDPOINT_MAP = {e["path"]: e for e in ENDPOINTS}
@@ -2641,12 +3145,14 @@ def error_payload(ep: Dict[str, Any], message: str, hint: Optional[str] = None) 
         "error": message,
         "hint": hint or "",
         "example": f"/api/{ep['path']}?key={DEMO_KEY}&{params}",
+        "powered_by": brand(),
     }
 
 
-async def run_endpoint(request: Request, ep: Dict[str, Any]) -> JSONResponse:
+async def run_endpoint(request: Request, ep: Dict[str, Any],
+                       extra_params: Optional[Dict[str, Any]] = None) -> JSONResponse:
     started = time.time()
-    params = {k: v for k, v in request.query_params.items()
+    params = {k: v for k, v in (extra_params if extra_params is not None else request.query_params).items()
               if k not in ("key", "nocache", "_", "format")}
     api_key = request.query_params.get("key", DEMO_KEY)
 
@@ -2707,7 +3213,7 @@ async def run_endpoint(request: Request, ep: Dict[str, Any]) -> JSONResponse:
         cached = cache_get(cache_key, ttl)
         if cached is not None:
             ms = int((time.time() - started) * 1000)
-            cached = mark(cached, "cache", ep)
+            cached = apply_brand(mark(cached, "cache", ep))
             fmt_c = (request.query_params.get("format") or "").lower()
             if fmt_c in ("text", "txt", "card", "plain") and isinstance(cached, dict) \
                     and cached.get("formatted"):
@@ -2815,7 +3321,7 @@ async def run_endpoint(request: Request, ep: Dict[str, Any]) -> JSONResponse:
     if payload is None and not nocache:
         stale = cache_get(cache_key, 7 * 24 * 3600)
         if stale is not None:
-            stale = mark(stale, "stale-cache", ep)
+            stale = apply_brand(mark(stale, "stale-cache", ep))
             ms = int((time.time() - started) * 1000)
             log_request(ep["path"], key_used, params, "stale-cache", 200, ms, client_ip(request))
             return JSONResponse(stale, headers={"X-Source": "stale-cache",
@@ -2831,7 +3337,7 @@ async def run_endpoint(request: Request, ep: Dict[str, Any]) -> JSONResponse:
         return JSONResponse(error_payload(
             ep, "Upstream / native source returned no data.", detail), status_code=502)
 
-    payload = mark(payload, source, ep)
+    payload = apply_brand(mark(payload, source, ep))
     ms = int((time.time() - started) * 1000)
 
     # ?format=text -> ready to share card (Telegram / WhatsApp friendly)
@@ -2863,6 +3369,7 @@ def mark(payload: Any, source: str, ep: Dict[str, Any]) -> Any:
             "source": source,
             "server_time_ist": now_ist(),
             "api_version": APP_VERSION,
+            "powered_by": brand(),
         }
     except Exception:
         pass
@@ -2874,7 +3381,10 @@ def mark(payload: Any, source: str, ep: Dict[str, Any]) -> Any:
 # =====================================================================
 def make_handler(ep: Dict[str, Any]):
     async def handler(request: Request, **kwargs) -> JSONResponse:
-        return await run_endpoint(request, ep)
+        params = dict(request.query_params)
+        if ep["path"] == "youtube-mp3" and not params.get("type"):
+            params["endpoint_hint"] = "youtube-mp3"
+        return await run_endpoint(request, ep, extra_params=params)
 
     sig = [inspect.Parameter("request", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=Request)]
     sig.append(inspect.Parameter(
@@ -3236,7 +3746,7 @@ async def admin_get_settings(request: Request):
     require_admin(request)
     keys = ["upstream_base", "upstream_key", "upstream_enabled", "demo_key_enabled",
             "cache_ttl", "cache_enabled", "rate_limit_per_min", "github_token",
-            "max_request_seconds"]
+            "max_request_seconds", "brand_tag", "hibp_api_key"]
     return {"success": True, "settings": {k: get_setting(k, "") for k in keys}}
 
 
@@ -3247,7 +3757,7 @@ async def admin_save_settings(request: Request, payload: Dict[str, Any] = Body(d
     for k, v in data.items():
         if k in ("upstream_base", "upstream_key", "upstream_enabled", "demo_key_enabled",
                  "cache_ttl", "cache_enabled", "rate_limit_per_min", "github_token",
-                 "max_request_seconds", "admin_password"):
+                 "max_request_seconds", "brand_tag", "hibp_api_key", "admin_password"):
             set_setting(k, str(v))
     return {"success": True}
 
@@ -3279,6 +3789,9 @@ async def list_endpoints(request: Request):
     return {
         "status": "active",
         "version": APP_VERSION,
+        "developer": brand(),
+        "powered_by": brand_line(),
+        "telegram": brand(),
         "total_endpoints": len(ENDPOINTS),
         "demo_key": DEMO_KEY,
         "base_url": base,
@@ -3326,7 +3839,8 @@ async def api_key_info(request: Request, key: str = ""):
 @app.get("/health")
 async def health():
     return {"status": "ok", "time_ist": now_ist(), "version": APP_VERSION,
-            "endpoints": len(ENDPOINTS), "database": os.path.abspath(DB_PATH)}
+            "endpoints": len(ENDPOINTS), "database": os.path.abspath(DB_PATH),
+            "developer": brand(), "powered_by": brand_line()}
 
 
 @app.get("/api/v1/health")
@@ -3419,6 +3933,7 @@ a{color:#79c0ff}
 <header>
   <h1>🛰️ OSINT &amp; Multi-Utility API Hub</h1>
   <div class="sub" id="baseUrl"></div>
+  <div class="sub" id="brandBar" style="font-weight:600"></div>
 </header>
 
 <nav>
@@ -3611,6 +4126,10 @@ a{color:#79c0ff}
     </div>
     <div class="row">
       <div><label>Max seconds per request (slow upstream ke liye)</label><input id="stMaxSec" type="number"></div>
+      <div><label>Brand tag (har response me "Powered by ...")</label><input id="stBrand" placeholder="@Supermannn_x"></div>
+    </div>
+    <div class="row">
+      <div><label>HaveIBeenPwned API key (optional, email breaches ke liye)</label><input id="stHibp" placeholder=""></div>
       <div><label>New admin password</label><input id="stAdmin" placeholder="change karne ke liye likho"></div>
     </div>
     <button class="action" onclick="saveSettings()">Save Settings</button>
@@ -3944,6 +4463,11 @@ async function loadSettings(){
     document.getElementById('stRate').value=s.rate_limit_per_min||'120';
     document.getElementById('stGithub').value=s.github_token||'';
     document.getElementById('stMaxSec').value=s.max_request_seconds||'50';
+    document.getElementById('stBrand').value=s.brand_tag||'@Supermannn_x';
+    document.getElementById('stHibp').value=s.hibp_api_key||'';
+    document.getElementById('brandBar').textContent='API Developer: '+(s.brand_tag||'@Supermannn_x')+' (Telegram)';
+    document.getElementById('brandFoot').textContent=(s.brand_tag||'@Supermannn_x');
+    document.getElementById('brandFoot2').textContent=(s.brand_tag||'@Supermannn_x');
   }catch(e){}
 }
 async function saveSettings(){
@@ -3956,7 +4480,9 @@ async function saveSettings(){
     cache_enabled: document.getElementById('stCache').value,
     rate_limit_per_min: document.getElementById('stRate').value,
     github_token: document.getElementById('stGithub').value,
-    max_request_seconds: document.getElementById('stMaxSec').value
+    max_request_seconds: document.getElementById('stMaxSec').value,
+    brand_tag: document.getElementById('stBrand').value,
+    hibp_api_key: document.getElementById('stHibp').value
   };
   const admin = document.getElementById('stAdmin').value;
   if(admin){ settings.admin_password = admin; TOKEN = admin; localStorage.setItem('osint_admin', admin);
@@ -4005,6 +4531,8 @@ async def root(request: Request):
     return {
         "status": "active",
         "version": APP_VERSION,
+        "developer": brand(),
+        "powered_by": brand_line(),
         "message": "OSINT & Multi-Utility API Hub. Use ?key=Demo with any endpoint.",
         "dashboard": f"{base}/dashboard",
         "docs": f"{base}/docs",

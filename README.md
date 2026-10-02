@@ -1,9 +1,9 @@
-# 🛰️ OSINT & Multi-Utility API Hub (53 Endpoints + SQLite Database + Dashboard)
+# 🛰️ OSINT & Multi-Utility API Hub (59 Endpoints + SQLite Database + Dashboard)
 
 Ye ek **ready-to-use API Hub** hai jo `https://osint-apis-hub.onrender.com` jaisi hi endpoint
 structure follow karta hai, lekin isme extra milta hai:
 
-* ✅ **53 endpoints** – `?key=Demo` ya aapki khud ki API key se
+* ✅ **59 endpoints** – `?key=Demo` ya aapki khud ki API key se
 * ✅ **SQLite database** – apna khud ka data (leak records, phone, GST, PAN, vehicle…) dashboard se add karein
 * ✅ **Web Dashboard** (`/dashboard`) – tablet/mobile friendly, bina coding ke sab kuch control
 * ✅ **Smart fallback** – har endpoint pehle free native source try karta hai, agar poori data
@@ -192,7 +192,7 @@ Agar aapko `Demo` key band karni ho to: **Settings → Demo key enabled → No �
 
 ---
 
-## 📋 Pure 53 Endpoints (Base URL ke saath)
+## 📋 Pure 59 Endpoints (Base URL ke saath)
 
 Base URL example: `https://aapka-url.onrender.com` (ya local me `http://localhost:8000`)
 
@@ -546,6 +546,122 @@ print(requests.get("https://aapka-url.onrender.com/api/vehicle-report",
 | Dashboard blank | URL ke aage `/dashboard` lagao; phir bhi na chale to Render logs dekho |
 | Deploy fail | Render → **Logs** tab me error padho; aksar `requirements.txt` ya `PORT` ki wajah se hota hai |
 
+
+### 🆕 Aadhaar Family + YouTube Downloader
+| # | Endpoint | Example |
+|---|----------|---------|
+| 54 | `/api/aadhaar-family` | `?key=Demo&aadhaar=861313813129` — parivar ke members + district/state |
+| 55 | `/api/aadhaar` | alias |
+| 56 | `/api/ration` | alias (ration card number se bhi try) |
+| 57 | `/api/youtube-download` | `?key=Demo&url=https://youtube.com/watch?v=X8X-XyK4CYE` |
+| 58 | `/api/ytdl` | alias |
+| 59 | `/api/youtube-mp3` | `?key=Demo&url=...` — sirf audio link |
+
+---
+
+# 📜 `/api/aadhaar-family` — AADHAAR FAMILY INTEL (NEW)
+
+12-digit Aadhaar/UID daalo → us record se **parivar ke members** (same father / same address)
+aur **district + state**.
+
+```
+GET /api/aadhaar-family?key=Demo&aadhaar=861313813129&format=text
+```
+
+```
+╔══════════════════════════════════════╗
+║       📜 AADHAAR FAMILY INTEL        ║
+╚══════════════════════════════════════╝
+
+💳 Aadhaar Number (searched)
+┗ 🎫 XXXXXXXX3129
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+👨‍👩‍👧‍👦 FAMILY MEMBERS (13)
+👤 1. Brajesh Kumar
+ ┗ 💳 Aadhaar: XXXXXXXX3129
+ ┗ 🔗 searched Aadhaar holder
+
+ 👤 2. Shailendra Singh
+ ┗ 💳 Aadhaar: XXXXXXXX3264
+ ┗ 🔗 possible sibling (same father)
+...
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📍 LOCATION DETAILS
+🗺️ District / State
+┗ 🏙️ JOGAAMAINPURI / UTTAR PRADESH
+┗ 📮 PIN: 206301
+
+⚡ Powered by @Supermannn_x  |  API Developer / Telegram: @Supermannn_x
+```
+
+* **Aadhaar hamesha MASKED** hota hai (sirf last 4 digit) — privacy ke liye.
+* `is_head` wale member ke saath 👑 (Head) lagta hai — jo naam sabse zyada logon ke
+  father field me aata hai.
+* `ration_card_number` / `fps_id` tabhi aate hain jab source me hon (apna data
+  Database tab se add kar sakte ho — category `aadhaar` ya `ration`).
+* Verhoeff checksum se number ki validity bhi check hoti hai (`aadhaar_valid_checksum`).
+
+---
+
+# ⬇️ `/api/youtube-download` — YouTube Downloader (NEW, Telegram bot ke liye perfect)
+
+```
+GET /api/youtube-download?key=Demo&url=https://youtube.com/watch?v=X8X-XyK4CYE&quality=720&format=text
+GET /api/youtube-mp3?key=Demo&url=https://youtube.com/watch?v=X8X-XyK4CYE      # sirf audio
+GET /api/youtube-download?key=Demo&url=...&type=audio                          # sirf audio
+```
+
+```
+╔══════════════════════════════════════╗
+║       ▶️ YOUTUBE DOWNLOAD LINKS      ║
+╚══════════════════════════════════════╝
+
+🎬 #video | सईयाँ सेवा करे | #Pawan Singh ...
+📺 Mahi Movies Presents
+⏱️ 3:01
+
+🎥 VIDEO 1: 720p · mp4
+┗ 🔗 https://rr2---sn-2onx5c-5x.googlevideo.com/videoplayback?...
+🎵 AUDIO 2: 129.509kbps · m4a
+┗ 🔗 https://rr2---sn-2onx5c-5x.googlevideo.com/videoplayback?...
+
+⚠️ Ye direct links 2–6 ghante me expire ho jate hain.
+```
+
+**JSON fields:** `download_url` (best video/audio), `audio_url`, `links[]` (type/quality/ext/url),
+`title`, `channel`, `duration`, `thumbnail`.
+
+**Kaise kaam karta hai:** server par **`yt-dlp`** chal kar direct links nikalta hai
+(`requirements.txt` me already add hai). Agar yt-dlp fail ho to upstream `youtube-all`
+ke download links try karta hai.
+
+> ⚠️ Render free tier ke IP ko YouTube kabhi-kabhi block kar deta hai — tab error aayega,
+> kuch der baad phir try karein. Links ~2–6 ghante me expire ho jate hain, isliye bot me
+> turant use karein.
+
+**Telegram bot me bhejne ka tariqa:** `download_url` ko bot se `sendVideo`/`sendAudio`
+me `video=url` / `audio=url` de dein — user ko file direct mil jayegi.
+
+---
+
+# ⚡ BRANDING — "Powered by @Supermannn_x" har jagah
+
+Har response me aapka credit hai:
+
+| Jagah | Kya dikhta hai |
+|-------|----------------|
+| Har JSON response | `"powered_by": "@Supermannn_x"` + `_meta.powered_by` |
+| Har `format=text` card | last line: `⚡ Powered by @Supermannn_x \| API Developer / Telegram: @Supermannn_x` |
+| Har error message | `"powered_by": "@Supermannn_x"` |
+| `/api/endpoints`, `/health`, `/` | `developer`, `powered_by`, `telegram` fields |
+| Dashboard | header me "API Developer: @Supermannn_x (Telegram)" + footer credit |
+
+Badalna ho to: **Dashboard → Settings → Brand tag** (ya env `BRAND_TAG`).
+
+
 ### ➕ Extra helper endpoints (bonus)
 | Endpoint | Kaam |
 |----------|------|
@@ -583,7 +699,7 @@ Ab jab koi `/api/num-info?key=Demo&q=919973700984` chalega, to response me
 
 | Tab | Kya milta hai |
 |-----|---------------|
-| 🔌 Endpoints | 53 endpoints ki list, search, category filter, live test + response + Copy URL |
+| 🔌 Endpoints | 59 endpoints ki list, search, category filter, live test + response + Copy URL |
 | 🗄️ Database | Records add / search / delete / CSV import / export |
 | 🔑 API Keys | Naya key banao, enable-disable karo, request count dekho |
 | 📊 Logs | Kaunsi API kab chali, source (native/upstream/cache), time, status |
