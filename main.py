@@ -4362,6 +4362,62 @@ async def list_endpoints(request: Request):
     }
 
 
+# =====================================================================
+# BACKUP / RESTORE  (Render free tier ka disk ephemeral hai —
+# restart pe data udd sakta hai, isliye JSON backup lo aur zaroorat
+# padne par wapas restore kar do. Dashboard → Settings → Backup.)
+# =====================================================================
+BACKUP_TABLES = ["settings", "api_keys", "resellers", "reseller_tokens", "orders", "payments"]
+
+
+@app.get("/admin/backup")
+def admin_backup(request: Request, download: str = "1"):
+    """Poora business data (settings, keys, resellers, orders, payments) JSON me."""
+    require_admin(request)
+    data = {"backup_version": 1, "created_at": now_ist(),
+            "powered_by": brand(), "tables": {}}
+    with db() as conn:
+        for t in BACKUP_TABLES:
+            try:
+                rows = conn.execute(f"SELECT * FROM {t}").fetchall()
+                data["tables"][t] = [dict(r) for r in rows]
+            except Exception:  # noqa: BLE001
+                data["tables"][t] = []
+    from fastapi.responses import JSONResponse
+    if download in ("1", "true", "yes"):
+        fname = "osint-hub-backup-" + now_ist("%Y%m%d-%H%M") + ".json"
+        return JSONResponse(content=data, headers={
+            "Content-Disposition": f'attachment; filename="{fname}"'})
+    return data
+
+
+@app.post("/admin/restore")
+def admin_restore(request: Request, payload: dict = Body(...)):
+    """Backup JSON wapas daalo — purana data replace ho jayega."""
+    require_admin(request)
+    tables = payload.get("tables") or {}
+    if not isinstance(tables, dict) or not tables:
+        raise HTTPException(status_code=400, detail="Backup file galat hai (tables nahi mile)")
+    restored = {}
+    with db() as conn:
+        for t, rows in tables.items():
+            if t not in BACKUP_TABLES or not isinstance(rows, list):
+                continue
+            try:
+                conn.execute(f"DELETE FROM {t}")
+                for r in rows:
+                    if not isinstance(r, dict):
+                        continue
+                    cols = ",".join(r.keys())
+                    qs = ",".join("?" for _ in r)
+                    conn.execute(f"INSERT OR REPLACE INTO {t} ({cols}) VALUES ({qs})",
+                                 list(r.values()))
+                restored[t] = len(rows)
+            except Exception as e:  # noqa: BLE001
+                restored[t] = f"error: {e}"
+    return {"success": True, "restored": restored, "powered_by": brand()}
+
+
 @app.get("/api/key-info")
 async def api_key_info(request: Request, key: str = ""):
     """Customers can check their own key: plan, expiry, remaining days, usage."""
@@ -4746,6 +4802,7 @@ a{color:#79c0ff}
   <button data-tab="keys">🔑 API Keys</button>
   <button data-tab="resellers">🤝 Resellers</button>
   <button data-tab="payments">💸 Payments</button>
+  <button data-tab="backup">💾 Backup</button>
   <button data-tab="logs">📊 Logs</button>
   <button data-tab="settings">⚙️ Settings</button>
   <button data-tab="help">📖 Help</button>
@@ -4970,6 +5027,36 @@ a{color:#79c0ff}
   </div>
 </div>
 
+<!-- BACKUP -->
+<div id="tab-backup" class="hidden">
+  <div class="card">
+    <h2>💾 Backup &amp; Restore</h2>
+    <p style="color:var(--muted);margin-top:0">
+      ⚠️ <b>Render free plan</b> ka disk temporary hota hai — server restart/sleep hone par
+      <b>keys, resellers, orders</b> sab reset ho sakte hain. Isliye roz ek backup file download
+      kar lein, aur zaroorat padne par yahin se restore kar dein.
+    </p>
+    <button class="action" onclick="doBackup()">⬇️ Backup Download (JSON)</button>
+    <button class="ghost" onclick="copyBackup()">📋 Clipboard me copy</button>
+    <div class="row" style="margin-top:14px">
+      <div><label>Restore — backup JSON yahan paste karein</label>
+        <textarea id="restoreBox" placeholder='{"tables":{"settings":[...],"api_keys":[...]}}'></textarea></div>
+    </div>
+    <input type="file" id="restoreFile" accept=".json" onchange="pickRestore(this)">
+    <button class="action" onclick="doRestore()">♻️ Restore</button>
+    <div id="backupInfo" style="margin-top:10px"></div>
+  </div>
+  <div class="card">
+    <h2>☁️ Permanent data (optional, ₹0 extra nahi to)</h2>
+    <p style="color:var(--muted);margin-top:0">
+      Free plan me data safe rakhne ka sabse aasan tarika: <b>roz backup download</b>.
+      Agar aap Render ka <b>Starter ($7/month)</b> lete hain to wahan <b>1GB persistent disk</b>
+      milta hai — <code>/var/data</code> mount kar ke <code>DB_PATH=/var/data/osint.db</code>
+      set kar dein, phir data kabhi reset nahi hoga.
+    </p>
+  </div>
+</div>
+
 <!-- SETTINGS -->
 <div id="tab-settings" class="hidden">
   <div class="card">
@@ -5058,7 +5145,7 @@ document.querySelectorAll('nav button').forEach(b=>{
   b.onclick = ()=>{
     document.querySelectorAll('nav button').forEach(x=>x.classList.remove('active'));
     b.classList.add('active');
-    ['endpoints','database','keys','resellers','payments','logs','settings','help'].forEach(t=>{
+    ['endpoints','database','keys','resellers','payments','backup','logs','settings','help'].forEach(t=>{
       document.getElementById('tab-'+t).classList.add('hidden');
     });
     document.getElementById('tab-'+b.dataset.tab).classList.remove('hidden');
@@ -5391,6 +5478,45 @@ async function loadResellerKeys(){
         '<td class="src">'+k.allowed_endpoints+'</td><td>'+(k.expires_at||'Lifetime')+'</td>'+
         '<td>'+k.requests+'</td></tr>').join('')+'</table>';
   }catch(e){}
+}
+
+
+/* ---------- backup / restore ---------- */
+let BACKUP_JSON = '';
+async function doBackup(){
+  const j = await adminFetch('/admin/backup?download=0');
+  BACKUP_JSON = JSON.stringify(j, null, 1);
+  document.getElementById('backupInfo').innerHTML =
+    '<p class="ok">Backup ready ✅ ('+BACKUP_JSON.length+' chars)</p>'+
+    '<pre>'+BACKUP_JSON.slice(0,1500)+'...</pre>';
+  const blob = new Blob([BACKUP_JSON], {type:'application/json'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'osint-hub-backup-'+new Date().toISOString().slice(0,10)+'.json';
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+}
+async function copyBackup(){
+  if(!BACKUP_JSON){ await doBackup(); }
+  try{ await navigator.clipboard.writeText(BACKUP_JSON); toast('Copy ho gaya ✅'); }
+  catch(e){ toast('Copy fail, download use karein', true); }
+}
+function pickRestore(inp){
+  const f = inp.files[0]; if(!f) return;
+  const fr = new FileReader();
+  fr.onload = e => document.getElementById('restoreBox').value = e.target.result;
+  fr.readAsText(f);
+}
+async function doRestore(){
+  const txt = document.getElementById('restoreBox').value.trim();
+  if(!txt) return toast('Pehle backup JSON paste karein', true);
+  let obj; try{ obj = JSON.parse(txt); }catch(e){ return toast('JSON galat hai', true); }
+  if(!confirm('Purana data replace ho jayega. Restore karein?')) return;
+  const r = await fetch('/admin/restore',{method:'POST',headers:adminHeaders(),body:JSON.stringify(obj)});
+  const j = await r.json();
+  if(j.success){ toast('Restore ho gaya ✅');
+    document.getElementById('backupInfo').innerHTML = '<p class="ok">Restored: '+JSON.stringify(j.restored)+'</p>';
+    setTimeout(()=>location.reload(), 1200);
+  } else toast(j.error||'Error', true);
 }
 
 /* ---------- payments / orders ---------- */

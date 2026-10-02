@@ -3,14 +3,32 @@ services:
     name: osint-api-hub
     runtime: python
     plan: free
+    region: singapore
+    healthCheckPath: /health
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
+      # Dashboard ka password. Deploy ke baad badal lena (Environment tab se).
       - key: ADMIN_PASSWORD
-        generateValue: true
+        value: admin123
+      # Upstream free OSINT source
       - key: UPSTREAM_BASE
         value: https://osint-apis-hub.onrender.com
       - key: UPSTREAM_KEY
         value: Demo
+      # Public demo key (log free try kar sakein)
+      - key: DEMO_KEY
+        value: Demo
+      # Branding — har response me dikhega
+      - key: BRAND_TAG
+        value: "@Supermannn_x"
+      # Apna UPI ID yahan daal dein (payment seedha aapko)
+      # - key: UPI_ID
+      #   value: aapka@okhdfcbank
+      # - key: UPI_NAME
+      #   value: OSINT API Hub
+      # Payment webhook security (optional)
+      # - key: WEBHOOK_SECRET
+      #   value: koi-bhi-lamba-secret

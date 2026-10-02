@@ -913,3 +913,46 @@ pip install requests
 python examples/telegram_bot_advanced.py
 ```
 Config me sirf 3 cheezein: `BOT_TOKEN`, `API_BASE` (apna Render URL), `API_KEY`.
+
+---
+
+# 💾 BACKUP & RESTORE (Render free plan ke liye BAHUT zaroori)
+
+⚠️ Render ke **free plan** me server ki disk **temporary** hoti hai — server restart / sleep /
+redeploy hone par `osint_database.db` reset ho sakta hai, yani **keys, resellers, orders sab udd sakte hain**.
+
+Isliye dashboard me naya **💾 Backup** tab hai:
+
+| Kaam | Kaise |
+|---|---|
+| Backup lena | Dashboard → **💾 Backup** → **⬇️ Backup Download (JSON)** |
+| Restore karna | Wahi tab → JSON paste karein (ya file choose karein) → **♻️ Restore** |
+
+API se bhi:
+```bash
+curl -H 'x-admin-token: admin123' https://YOUR-URL.onrender.com/admin/backup -o backup.json
+curl -X POST -H 'x-admin-token: admin123' -H 'Content-Type: application/json' \
+     -d @backup.json https://YOUR-URL.onrender.com/admin/restore
+```
+
+**Permanent solution (optional):** Render **Starter $7/month** → 1GB persistent disk
+→ mount path `/var/data` → Environment me `DB_PATH=/var/data/osint.db`. Phir data kabhi reset nahi hoga.
+
+---
+
+# ☁️ RENDER PE DEPLOY (naye GitHub account `himanshu74919-cpu` ke saath)
+
+Repo: **https://github.com/himanshu74919-cpu/ToolVault-**
+
+1. **render.com** kholo → **Sign in with GitHub**
+2. GitHub login aaye to **`himanshu74919-cpu`** se login karo → **Authorize Render**
+3. Dashboard → **New +** → **Blueprint**
+4. Repo list me **`ToolVault-`** select karo → **Apply**
+5. 2–4 minute me deploy ho jayega → URL: `https://osint-api-hub-XXXX.onrender.com`
+6. **Environment** tab → `ADMIN_PASSWORD` = `admin123` (chahe to badal do), `UPI_ID` = apna UPI → **Save**
+7. **UptimeRobot.com** pe free monitor: `https://YOUR-URL.onrender.com/health` (har 5 min)
+
+Baad me:
+- `/site` → aapki API-selling website
+- `/dashboard` → admin panel (password `admin123`)
+- `/dashboard → 💾 Backup` → roz ek backup download kar lein
