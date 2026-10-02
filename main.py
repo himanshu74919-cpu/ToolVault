@@ -28,6 +28,7 @@ import secrets
 import sqlite3
 import time
 import urllib.parse
+import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
@@ -1426,18 +1427,62 @@ def _person_from_record(rec: Dict[str, Any], source: str) -> Dict[str, Any]:
                 piece = re.sub(r"\D", "", piece)
                 if 6 <= len(piece) <= 20 and piece not in govt_ids:
                     govt_ids.append(piece)
+    _name = _title_name(rec.get("full_name") or rec.get("name") or "")
+    _region = _clean_text(rec.get("region") or rec.get("circle") or rec.get("operator") or "")
+    # naam khaali ho aur region me asli naam lage → wahi naam hai (upstream data quirk)
+    if not _name and _looks_like_person_name(_region):
+        _name, _region = _title_name(_region), ""
     return {
-        "name": _title_name(rec.get("full_name") or rec.get("name") or ""),
+        "name": _name,
         "father_name": _title_name(rec.get("the_name_of_the_father") or rec.get("father_name")
                                    or rec.get("father") or ""),
         "phones": phones,
-        "region": _clean_text(rec.get("region") or rec.get("circle") or rec.get("operator") or ""),
+        "region": _region,
         "govt_ids": govt_ids,
         "emails": [_clean_text(rec.get("email"))] if _clean_text(rec.get("email", "")) else [],
         "addresses": [_clean_text(rec.get("address"))] if _clean_text(rec.get("address", "")) else [],
         "sources": [source],
         "record_count": 1,
     }
+
+
+# operator / circle / state ke words — inhe naam nahi samajhna
+_REGION_WORDS = {
+    "jio", "airtel", "vi", "vodafone", "idea", "bsnl", "mtnl", "reliance", "tata",
+    "up", "upw", "upe", "east", "west", "north", "south", "central", "circle",
+    "gsm", "lte", "3g", "4g", "5g", "mumbai", "delhi", "kolkata", "chennai",
+    "karnataka", "karnatka", "bihar", "uttar", "pradesh", "madhya", "bengal",
+    "tamil", "nadu", "maharashtra", "punjab", "haryana", "rajasthan", "gujarat",
+    "kerala", "assam", "odisha", "orissa", "jharkhand", "andhra", "telangana",
+    "himachal", "jammu", "kashmir", "goa", "tripura", "manipur", "nagaland",
+    "india", "hind", "nation", "unknown", "na",
+}
+
+
+def _no_name_label(person: Dict[str, Any]) -> str:
+    """Naam source me nahi hai to father/relation se pehchan banao ('Unknown' nahi likhte)."""
+    father = _title_name(person.get("father_name") or "")
+    if father:
+        return f"{father} ka parivar"
+    for ph in person.get("phones") or []:
+        return f"Record (+{str(ph)[-10:]})"
+    return "Name not in source"
+
+
+def _looks_like_person_name(value: str) -> bool:
+    """Upstream kabhi-kabhi naam 'region' field me daal deta hai (jaise 'Bipin Baitha')."""
+    v = (value or "").strip().strip(";,")
+    if not v or len(v) > 40 or not re.match(r"^[A-Za-z][A-Za-z.\s'-]*$", v):
+        return False
+    words = [w for w in re.split(r"[\s;]+", v) if w]
+    if len(words) < 2:
+        return False
+    if v.isupper():                      # "JIO UPE UPW", "UP EAST" — region hai
+        return False
+    low = v.lower()
+    if any(w in low for w in _REGION_WORDS):
+        return False
+    return all(len(w) >= 2 for w in words)
 
 
 def _title_name(value: str) -> str:
@@ -2156,229 +2201,42 @@ def parse_location(address: str) -> Dict[str, str]:
     return {"district": district, "state": state, "pincode": (re.findall(r"\b\d{6}\b", addr) or [""])[0]}
 
 
-def format_aadhaar_card(data: Dict[str, Any]) -> str:
-    lines = ["╔══════════════════════════════════════╗",
-             "║       📜 AADHAAR FAMILY INTEL        ║",
-             "╚══════════════════════════════════════╝", ""]
-    lines.append("💳 Aadhaar Number (searched)")
-    lines.append(f"┗ 🎫 {data.get('aadhaar_masked', 'NA')}")
-    lines.append("")
-    if data.get("ration_card_number") or data.get("fps_id"):
-        lines.append("📊 Card Details")
-        if data.get("ration_card_number") and data["ration_card_number"] != "NA":
-            lines.append(f"┗ 🎫 Ration Card: {data['ration_card_number']}")
-        if data.get("fps_id") and data["fps_id"] != "NA":
-            lines.append(f"┗ 🏪 FPS ID: {data['fps_id']}")
-        lines.append("")
-    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    lines.append("")
-    members = data.get("members") or []
-    lines.append(f"👨‍👩‍👧‍👦 FAMILY MEMBERS ({len(members)})")
-    for idx, m in enumerate(members, 1):
-        head = " 👑 (Head)" if m.get("is_head") else ""
-        lines.append(f"👤 {idx}. {m.get('name') or 'Unknown'}{head}")
-        lines.append(f" ┗ 💳 Aadhaar: {m.get('aadhaar_masked', 'XXXXXXXX')}")
-        if m.get("relation") and not m.get("is_head"):
-            lines.append(f" ┗ 🔗 {m['relation']}")
-        lines.append("")
-    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    lines.append("")
-    lines.append("📍 LOCATION DETAILS")
-    loc = data.get("location") or {}
-    lines.append("🗺️ District / State")
-    district_state = " / ".join([x for x in [loc.get("district"), loc.get("state")] if x]) or "NA"
-    lines.append(f"┗ 🏙️ {district_state}")
-    if loc.get("pincode"):
-        lines.append(f"┗ 📮 PIN: {loc['pincode']}")
-    lines.append("")
-    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+def format_aadhaar_card(payload: Dict[str, Any]) -> str:
+    """Bot-ke-liye ready Hinglish card."""
+    loc = payload.get("location") or {}
+    members = payload.get("members") or []
+    city = (loc.get("city") or "NA").upper()
+    state = (loc.get("state") or "NA").upper()
+    lines = [
+        "╔══════════════════════════════════════╗",
+        "║      📜 AADHAAR FAMILY INTEL          ║",
+        "╚══════════════════════════════════════╝",
+        "",
+        f"💳 Aadhaar: {payload.get('aadhaar_masked', 'XXXXXXXXXXXX')}",
+        f"✔️ Verhoeff check: {'VALID ✅' if payload.get('aadhaar_valid_checksum') else 'INVALID ❌'}",
+        f"🎫 Ration Card Number: {payload.get('ration_card_number', 'NA')}",
+        f"🏪 FPS ID: {payload.get('fps_id', 'NA')}",
+        "",
+        f"👨‍👩‍👧‍👦 FAMILY MEMBERS ({len(members)})",
+    ]
+    if members:
+        for idx, member in enumerate(members, 1):
+            name = member.get("name") or "Name not in source"
+            if member.get("is_head"):
+                name += "  👑 (Head)"
+            lines.append(f"{idx}. {name} — Aadhaar: {member.get('aadhaar_masked', 'XXXXXXXXXXXX')}")
+    else:
+        lines.append("❌ Koi family member nahi mila.")
+    lines += [
+        "",
+        "📍 LOCATION DETAILS",
+        f"🏙️ {city} ({state})",
+        f"📮 Pincode: {loc.get('pincode') or 'NA'}",
+        "",
+        "⏱️ " + str(payload.get("response_time", "-")),
+        "🔗 API by @Supermannn_x",
+    ]
     return "\n".join(lines)
-
-
-async def native_aadhaar_family(params: Dict[str, Any], request: Request) -> Tuple[Optional[Dict], bool]:
-    """12-digit Aadhaar/UID daalo → us parivar ke members + location."""
-    started = time.time()
-    raw = (params.get("aadhaar") or params.get("uid") or params.get("q")
-           or params.get("ration") or "").strip()
-    aadhaar = re.sub(r"\D", "", raw)
-    if len(aadhaar) != 12:
-        return {"success": False, "error": "Aadhaar must be exactly 12 digits.",
-                "input": raw,
-                "formatted": ("╔══════════════════════════════════════╗\n"
-                              "║       📜 AADHAAR FAMILY INTEL        ║\n"
-                              "╚══════════════════════════════════════╝\n\n"
-                              "❌ 12 digit ka Aadhaar number daalo. Example: /api/aadhaar-family?key=Demo&aadhaar=861313813129"),
-                "_no_cache": True}, True
-
-    deadline = float(get_setting("max_request_seconds", "50") or 50)
-    records: List[Tuple[Dict[str, Any], str]] = []
-    sources: List[str] = []
-
-    # 1) own database (ration / aadhaar records aap khud daal sakte ho)
-    for category in ("aadhaar", "ration", "leak", "general"):
-        for rec in custom_lookup(category, aadhaar):
-            records.append((rec, f"own-db:{category}"))
-            if f"own-db:{category}" not in sources:
-                sources.append(f"own-db:{category}")
-
-    # 2) upstream leak / number databases (Aadhaar document number se search)
-    if not records or str(params.get("deep", "1")).lower() in ("1", "true", "yes"):
-        recs, used = await _collect_leak_records(aadhaar, sources=("num-info", "leak-v1", "leak-v2"),
-                                                 timeout=30, deadline_seconds=deadline * 0.55)
-        records.extend(recs)
-        sources.extend([s for s in used if s not in sources])
-
-    people = merge_people(records, "")
-    if not people:
-        return {"success": False, "query": aadhaar, "aadhaar_masked": mask_aadhaar(aadhaar),
-                "record_count": 0, "members": [],
-                "error": "Is Aadhaar number ke liye koi record nahi mila.",
-                "sources_used": sources,
-                "formatted": ("╔══════════════════════════════════════╗\n"
-                              "║       📜 AADHAAR FAMILY INTEL        ║\n"
-                              "╚══════════════════════════════════════╝\n\n"
-                              f"💳 Aadhaar: {mask_aadhaar(aadhaar)}\n\n"
-                              "❌ Koi record nahi mila.\n"
-                              "💡 Dashboard → Database me apna ration/aadhaar data add kar sakte ho "
-                              "(category: aadhaar/ration)."),
-                "_no_cache": True}, True
-
-    primary = people[0]
-    p_tokens: set = set()
-    for addr in primary.get("addresses") or []:
-        p_tokens |= addr_tokens(addr)
-    p_father = (primary.get("father_name") or "").lower()
-    p_name = (primary.get("name") or "").lower()
-
-    # 3) family expansion (same father / same address / locality words)
-    expanded: List[Tuple[Dict[str, Any], str]] = []
-    deep = str(params.get("deep", "1")).lower() in ("1", "true", "yes")
-    if deep:
-        terms = []
-        if len(p_father) >= 8 and " s/o" not in p_father:
-            terms.append(primary["father_name"])
-        terms.extend(locality_terms(primary, limit=2))
-        for term in terms[:3]:
-            if time.time() - started > deadline * 0.85:
-                break
-            recs, used = await _collect_leak_records(term, sources=("leak-v1",),
-                                                     timeout=25, deadline_seconds=20)
-            expanded.extend(recs)
-            sources.extend([s for s in used if s not in sources])
-
-    all_people = merge_people(records + expanded, "")
-    members: List[Dict[str, Any]] = []
-    for person in all_people:
-        name = (person.get("name") or "").lower()
-        father = (person.get("father_name") or "").lower()
-        tokens: set = set()
-        for addr in person.get("addresses") or []:
-            tokens |= addr_tokens(addr)
-        shared = p_tokens & tokens
-        same_father = bool(p_father and father == p_father)
-        is_child = bool(p_name and father == p_name)
-        same_person = (name == p_name and father == p_father)
-        if not same_person and (len(shared) >= 2 or (same_father and len(shared) >= 1)
-                                or (is_child and len(shared) >= 1)):
-            if not name and len(shared) < 3:
-                continue
-            rel = ("child / dependent" if is_child else
-                   "possible sibling (same father)" if same_father else
-                   "same address / locality")
-            members.append({
-                "name": _title_name(person.get("name") or "") or "Unknown",
-                "aadhaar_masked": mask_aadhaar((person.get("govt_ids") or [""])[0]),
-                "relation": rel,
-                "father_name": person.get("father_name") or "",
-                "phones": person.get("phones") or [],
-                "address": (person.get("addresses") or [""])[0],
-                "match_score": len(shared) + (3 if same_father else 0),
-            })
-    members.sort(key=lambda m: -m.get("match_score", 0))
-
-    # always keep the searched person on top
-    members = [{
-        "name": _title_name(primary.get("name") or "") or "Unknown",
-        "aadhaar_masked": mask_aadhaar(aadhaar),
-        "relation": "searched Aadhaar holder",
-        "father_name": primary.get("father_name") or "",
-        "phones": primary.get("phones") or [],
-        "address": (primary.get("addresses") or [""])[0],
-        "match_score": 999,
-    }] + members[:12]
-
-    # head of family: jo naam sabse zyado ke father field me aaye
-    father_counts: Dict[str, int] = {}
-    for m in members:
-        f = (m.get("father_name") or "").strip().lower()
-        if f:
-            father_counts[f] = father_counts.get(f, 0) + 1
-    head_name = ""
-    if father_counts:
-        head_name = max(father_counts.items(), key=lambda kv: kv[1])[0]
-    for m in members:
-        m["is_head"] = bool(head_name and (m.get("name") or "").strip().lower() == head_name)
-
-    location = parse_location((primary.get("addresses") or [""])[0])
-    ration_card = "NA"
-    fps_id = "NA"
-    for m in members:
-        pass
-    for rec, src in records:
-        for key in ("ration_card", "ration_card_number", "rc_number", "ration"):
-            if rec.get(key):
-                ration_card = str(rec[key])
-        for key in ("fps_id", "fps", "fps_code", "shop_id"):
-            if rec.get(key):
-                fps_id = str(rec[key])
-
-    payload = {
-        "success": True,
-        "aadhaar_masked": mask_aadhaar(aadhaar),
-        "aadhaar_valid_checksum": verhoeff_valid(aadhaar),
-        "ration_card_number": ration_card,
-        "fps_id": fps_id,
-        "primary": primary,
-        "members": members,
-        "member_count": len(members),
-        "location": location,
-        "sources_used": sources,
-        "response_time": f"{round(time.time() - started, 2)}s",
-        "timestamp_ist": now_ist("%d-%m-%Y %H:%M:%S"),
-        "note": ("Aadhaar numbers hamesha MASKED hote hain (sirf last 4 digit). "
-                 "Ration card / FPS ID tabhi aata hai jab source me ho "
-                 "(apna data Database tab se add kar sakte ho)."),
-    }
-    payload["formatted"] = format_aadhaar_card(payload)
-    return payload, False
-
-
-# ---------------------------------------------------------------------
-# YOUTUBE DOWNLOADER (for Telegram bots)
-# ---------------------------------------------------------------------
-# Cloud/datacenter IP (Render free) par YouTube yt-dlp ko block kar deta hai.
-# Ek baar fail hone ke baad 10 minute tak yt-dlp skip karke seedha fallback try karenge.
-_YT_STATE = {"ytdlp_fail_until": 0.0}
-
-# Public YouTube front-end APIs — datacenter IP (Render) par yt-dlp block ho jata hai,
-# tab ye fallback direct streaming links de dete hain.
-PIPED_INSTANCES = [
-    "https://pipedapi.kavin.rocks",
-    "https://pipedapi.adminforge.de",
-    "https://api.piped.private.coffee",
-    "https://pipedapi.reallyaweso.me",
-    "https://pipedapi.drgns.space",
-]
-INVIDIOUS_INSTANCES = [
-    "https://invidious.f5.si",
-    "https://yewtu.be",
-    "https://inv.nadeko.net",
-    "https://invidious.nerdvpn.de",
-    "https://inv.vern.cc",
-    "https://invidious.privacyredirect.com",
-]
-
-_INVIDIOUS_CACHE = {"at": 0.0, "list": []}
 
 
 def _invidious_instance_list() -> List[str]:
@@ -2791,15 +2649,24 @@ async def native_num_info_full(params: Dict[str, Any], request: Request) -> Tupl
                 if f"own-db:{category}" not in sources:
                     sources.append(f"own-db:{category}")
 
-    # 2) upstream sources
+    # 2) upstream sources — SAB EK SAATH (parallel), warna har query 25-30s leti thi
     deadline = float(get_setting("max_request_seconds", "50") or 50)
+    paths = ("num-info", "leak-v1", "leak-v2") if deep else ("num-info", "leak-v1")
+
     for variant in variants:
-        for source_path in ("num-info", "leak-v1", "leak-v2"):
-            if time.time() - started > deadline:
-                break
-            tried.append(f"{source_path}:{variant}")
-            data, _ = await upstream_call(source_path, {"q": variant}, timeout=35, retries=0)
-            if data is None:
+        remaining = deadline - (time.time() - started)
+        if remaining < 5:
+            break
+        tmo = int(min(35, max(6, remaining - 2)))
+        tried.extend(f"{p_}:{variant}" for p_ in paths)
+        results = await asyncio.gather(
+            *[upstream_call(p_, {"q": variant}, timeout=tmo, retries=0) for p_ in paths],
+            return_exceptions=True)
+        for source_path, res in zip(paths, results):
+            if isinstance(res, BaseException):
+                continue
+            data = res[0] if isinstance(res, (tuple, list)) and res else None
+            if not data:
                 continue
             records = _norm_records(data)
             if records:
