@@ -956,3 +956,41 @@ Baad me:
 - `/site` → aapki API-selling website
 - `/dashboard` → admin panel (password `admin123`)
 - `/dashboard → 💾 Backup` → roz ek backup download kar lein
+
+---
+
+# ✅ LIVE DEPLOYMENT (verified)
+
+**URL: https://osint-api-hub.onrender.com**
+
+| Check | Status |
+|---|---|
+| `/health` → 59 endpoints, `developer: @Supermannn_x` | ✅ 200 |
+| `/` `/site` `/store` (landing page) | ✅ 200 |
+| `/dashboard` (admin panel) | ✅ 200 |
+| `/api/plans` (6 plans, UPI ID set) | ✅ 200 |
+| `/api/num-info?key=Demo&q=9058390341` | ✅ 200 (~19s) |
+| `/api/vehicle-report?key=Demo&q=BR30AR0802` | ✅ 200 (~5s) |
+| `/api/aadhaar-family?key=Demo&aadhaar=861313813129` | ✅ 200 (~30s cold) |
+| `/api/email-info`, `/api/pass-check` | ✅ 200 |
+| `/api/youtube-download` (video 1080p mp4 + audio m4a) | ✅ 200 (~4s) |
+| `/api/youtube-mp3` | ✅ 200 (~0.6s) |
+| `/api/create-order` → UPI link + QR | ✅ 200 |
+
+## ⬇️ YouTube download kaise kaam karta hai (cloud par)
+
+Cloud/datacenter IP (Render free) se YouTube `yt-dlp` ko block kar deta hai
+(`Failed to extract any player response`). Isliye endpoint ye order try karta hai:
+
+1. **Invidious** (public instance, proxied links — kisi bhi device se chalte hain) ← cloud par yahi kaam karta hai
+2. **Piped** (backup)
+3. **yt-dlp** (agar server IP block na ho — best quality)
+4. Upstream metadata (aakhri koshish)
+
+Agar yt-dlp ek baar fail ho jaye to wo **15 minute ke liye skip** ho jata hai, jisse
+response time ~1-4 second rehta hai. `?debug=1` lagane par poora diagnostic dikhta hai:
+```
+/api/youtube-download?key=Demo&url=...&debug=1
+```
+⚠️ Ye third-party public instances par depend karta hai — kabhi-kabhi down ho sakte hain.
+Isliye YouTube ko paid plan ka core feature banane ki jagah **bonus** rakhein.
