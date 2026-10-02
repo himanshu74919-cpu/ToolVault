@@ -2429,7 +2429,10 @@ def _invidious_streams(vid: str, mode: str, tries: int = 3,
     for base in _invidious_instance_list()[:tries]:
         tried.append(base)
         try:
-            r = httpx.get(f"{base}/api/v1/videos/{vid}", timeout=per_timeout,
+            # local=true -> stream Invidious instance ke through proxy hota hai,
+            # isliye link kisi bhi device se chal jata hai (googlevideo direct links
+            # instance ke IP se bandhe hote hain).
+            r = httpx.get(f"{base}/api/v1/videos/{vid}?local=true", timeout=per_timeout,
                           headers={"User-Agent": "Mozilla/5.0"}, follow_redirects=True)
             if r.status_code != 200:
                 continue
@@ -2457,7 +2460,8 @@ def _invidious_streams(vid: str, mode: str, tries: int = 3,
                 else:
                     links.append({"type": "video", "provider": "invidious",
                                   "quality": s.get("qualityLabel") or s.get("quality") or "",
-                                  "ext": s.get("container") or "mp4", "url": u})
+                                  "ext": s.get("container") or "mp4", "url": u,
+                                  "note": "proxy link - browser me kholein"})
             if links:
                 vids = [l for l in links if l["type"] == "video"]
                 if mode != "audio" and vids:
@@ -2470,7 +2474,7 @@ def _invidious_streams(vid: str, mode: str, tries: int = 3,
                 return {"video_id": vid, "title": d.get("title"),
                         "channel": d.get("author"), "duration": d.get("lengthSeconds"),
                         "thumbnail": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
-                        "links": links, "provider": "invidious", "tried": tried}
+                        "links": links, "provider": "invidious-proxy", "tried": tried}
         except Exception:  # noqa: BLE001
             continue
     return {"links": [], "tried": tried}
