@@ -2420,12 +2420,13 @@ def _piped_streams(vid: str, mode: str, quality: str, tries: int = 3,
     return {"links": [], "tried": tried}
 
 
-def _invidious_streams(vid: str, mode: str, tries: int = 3,
+def _invidious_streams(vid: str, mode: str, quality: str = "", tries: int = 3,
                        per_timeout: float = 8.0) -> Dict[str, Any]:
     """Invidious API se direct links (blocking fallback)."""
     import httpx
 
     tried: List[str] = []
+    errors: List[str] = []
     for base in _invidious_instance_list()[:tries]:
         tried.append(base)
         try:
@@ -2465,19 +2466,42 @@ def _invidious_streams(vid: str, mode: str, tries: int = 3,
             if links:
                 vids = [l for l in links if l["type"] == "video"]
                 if mode != "audio" and vids:
-                    vids.sort(key=lambda l: (str(l["quality"]).replace("p", "").isdigit()
-                                             and -int(str(l["quality"]).replace("p", "")) or 0))
-                    keep = vids[:1] + [l for l in links if l["type"] == "audio"][:1]
-                    links = keep
+                    want_h = int(quality) if quality.isdigit() else 720
+                    mp4 = [l for l in vids if (l.get("ext") or "") == "mp4"] or vids
+
+                    def _h(l):
+                        q = str(l.get("quality") or "").replace("p", "")
+                        return int(q) if q.isdigit() else 0
+
+                    mp4.sort(key=lambda l: (-_h(l), abs(_h(l) - want_h)))
+                    best = mp4[0]
+                    # 1080p se upar ki jagah desired height ke sabse kareeb wala
+                    if _h(best) > 1080:
+                        cand = [l for l in mp4 if _h(l) <= 1080]
+                        if cand:
+                            best = cand[0]
+                    def _aud_key(l):
+                        br = int(str(l.get("quality") or "").replace("kbps", "") or 0)
+                        pref = 0 if (l.get("ext") or "") in ("m4a", "mp4") else 1
+                        return (pref, -br)
+
+                    aud = sorted([l for l in links if l["type"] == "audio"], key=_aud_key)
+                    links = [best] + aud[:1]
                 else:
-                    links = [l for l in links if l["type"] == "audio"][:1] or links[:1]
+                    def _aud_key2(l):
+                        br = int(str(l.get("quality") or "").replace("kbps", "") or 0)
+                        return (0 if (l.get("ext") or "") in ("m4a", "mp4") else 1, -br)
+
+                    aud = sorted([l for l in links if l["type"] == "audio"], key=_aud_key2)
+                    links = aud[:1] or links[:1]
                 return {"video_id": vid, "title": d.get("title"),
                         "channel": d.get("author"), "duration": d.get("lengthSeconds"),
                         "thumbnail": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
                         "links": links, "provider": "invidious-proxy", "tried": tried}
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{base}: {type(exc).__name__} {str(exc)[:80]}")
             continue
-    return {"links": [], "tried": tried}
+    return {"links": [], "tried": tried, "errors": errors}
 
 
 def _yt_extract(url: str, mode: str, quality: str, timeout: int = 40) -> Dict[str, Any]:
@@ -2567,63 +2591,65 @@ async def native_youtube_download(params: Dict[str, Any], request: Request) -> T
     # Render free plan ~25-30s me request maar deta hai, isliye fallback chain tight rakhi hai
     hard_deadline = min(deadline, 26.0)
     loop = __import__("asyncio").get_event_loop()
-    ytdlp_skipped = time.time() < _YT_STATE["ytdlp_fail_until"]
-    if not ytdlp_skipped:
-        try:
-            result = await loop.run_in_executor(
-                None, lambda: _yt_extract(watch, "audio" if mode == "audio" else mode, quality,
-                                          timeout=int(max(8, min(hard_deadline * 0.45, 14)))))
-        except Exception as exc:
-            error = str(exc)[:200]
-    else:
-        result = {}
-
-    ytdlp_err = (result.get("error") if isinstance(result, dict) else None) or error or None
-    if ytdlp_err and not (result.get("links") if isinstance(result, dict) else None):
-        _YT_STATE["ytdlp_fail_until"] = time.time() + 600
-
-    debug["yt_dlp"] = {
-        "links": len(result.get("links") or []) if isinstance(result, dict) else 0,
-        "error": ytdlp_err,
-        "skipped_recent_failure": ytdlp_skipped,
-    }
-
-    # fallback 1: Piped API (datacenter IP par bhi kaam karta hai)
-    links = result.get("links") if isinstance(result, dict) else None
+    # Cloud (Render) par yt-dlp aksar block hota hai aur 15-30s barbaad karta hai,
+    # isliye pehle fast public APIs try karte hain; yt-dlp last me (sirf agar time bache).
     upstream_links: List[Dict[str, Any]] = []
     sources: List[str] = []
-    if not (result.get("links") if isinstance(result, dict) else None) \
-            and (time.time() - started) < hard_deadline * 0.85:
-        left = hard_deadline - (time.time() - started)
-        try:
-            piped = await loop.run_in_executor(
-                None, lambda: _piped_streams(vid, "audio" if mode == "audio" else mode, quality,
-                                             tries=3, per_timeout=max(3.0, min(6.0, left / 3))))
-            debug["piped"] = {"links": len(piped.get("links") or []),
-                              "tried": piped.get("tried", [])}
-            if piped.get("links"):
-                result = piped
-                sources.append("piped")
-        except Exception as exc:  # noqa: BLE001
-            debug["piped"] = {"error": str(exc)[:120]}
 
-    # fallback 2: Invidious API
-    if not (result.get("links") if isinstance(result, dict) else None) \
-            and (time.time() - started) < hard_deadline * 0.92:
-        left = hard_deadline - (time.time() - started)
+    async def _try(fn, name, kwargs):
+        if result_holder.get("links"):
+            return
+        remaining = hard_deadline - (time.time() - started)
+        if remaining < 3:
+            return
         try:
-            inv = await loop.run_in_executor(
-                None, lambda: _invidious_streams(vid, "audio" if mode == "audio" else mode,
-                                                 tries=3, per_timeout=max(3.5, min(6.0, left / 3))))
-            debug["invidious"] = {"links": len(inv.get("links") or []),
-                                  "tried": inv.get("tried", [])}
-            if inv.get("links"):
-                result = inv
-                sources.append("invidious")
+            kwargs = dict(kwargs)
+            if "per_timeout" in kwargs:
+                kwargs["per_timeout"] = max(2.5, min(kwargs["per_timeout"], remaining / 3))
+            out = await loop.run_in_executor(None, lambda: fn(**kwargs))
+            dbg = {"links": len(out.get("links") or []), "tried": out.get("tried", [])}
+            if out.get("errors"):
+                dbg["errors"] = out["errors"][:3]
+            debug[name] = dbg
+            if out.get("links"):
+                result_holder.update(out)
+                sources.append(name)
         except Exception as exc:  # noqa: BLE001
-            debug["invidious"] = {"error": str(exc)[:120]}
-    if not (result.get("links") if isinstance(result, dict) else None) \
-            and (time.time() - started) < hard_deadline * 0.9:
+            debug[name] = {"error": str(exc)[:120]}
+
+    result_holder: Dict[str, Any] = {}
+
+    # 1) Invidious (proxied links — kisi bhi device se chalte hain)
+    await _try(_invidious_streams, "invidious",
+               {"vid": vid, "mode": "audio" if mode == "audio" else mode,
+                "quality": quality, "tries": 3, "per_timeout": 7.0})
+    # 2) Piped
+    if not result_holder.get("links"):
+        await _try(_piped_streams, "piped",
+                   {"vid": vid, "mode": "audio" if mode == "audio" else mode,
+                    "quality": quality, "tries": 2, "per_timeout": 6.0})
+    # 3) yt-dlp (local/yahan block na ho to best quality)
+    if not result_holder.get("links") and (hard_deadline - (time.time() - started)) > 14:
+        ytdlp_skipped = time.time() < _YT_STATE["ytdlp_fail_until"]
+        if ytdlp_skipped:
+            debug["yt_dlp"] = {"links": 0, "error": None, "skipped_recent_failure": True}
+        else:
+            try:
+                out = await loop.run_in_executor(
+                    None, lambda: _yt_extract(watch, "audio" if mode == "audio" else mode,
+                                              quality, timeout=int(min(20, hard_deadline - (time.time() - started) - 4))))
+            except Exception as exc:  # noqa: BLE001
+                out = {"error": str(exc)[:200]}
+            ytdlp_err = out.get("error")
+            debug["yt_dlp"] = {"links": len(out.get("links") or []), "error": ytdlp_err,
+                               "skipped_recent_failure": False}
+            if out.get("links"):
+                result_holder.update(out)
+                sources.append("yt-dlp")
+            elif ytdlp_err:
+                _YT_STATE["ytdlp_fail_until"] = time.time() + 900
+    # 4) upstream YouTube metadata/links (aakhri koshish)
+    if not result_holder.get("links") and (time.time() - started) < hard_deadline * 0.9:
         up, _ = await upstream_call("youtube-all", {"url": watch},
                                     timeout=int(max(8, hard_deadline - (time.time() - started) - 2)),
                                     retries=0)
@@ -2638,14 +2664,17 @@ async def native_youtube_download(params: Dict[str, Any], request: Request) -> T
                                 "type": "video", "provider": provider,
                                 "quality": item.get("quality") or item.get("format") or "",
                                 "url": item.get("url")})
-            result = {
+            result_holder.update({
                 "video_id": up.get("video_id") or vid,
                 "title": ((up.get("video_info") or {}) or {}).get("title"),
                 "channel": ((up.get("channel_info") or {}) or {}).get("title"),
                 "duration": ((up.get("video_info") or {}) or {}).get("lengthSeconds"),
                 "thumbnail": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
                 "links": upstream_links,
-            }
+            })
+
+    result = result_holder
+    error = result.get("error") or ""
 
     all_links = (result.get("links") or []) if isinstance(result, dict) else []
     video_link = next((l for l in all_links if l.get("type") == "video"), None)
@@ -2690,7 +2719,7 @@ async def native_youtube_download(params: Dict[str, Any], request: Request) -> T
         "download_url": (video_link or audio_link or {}).get("url"),
         "audio_url": (audio_link or {}).get("url"),
         "error": error or (result.get("error") if isinstance(result, dict) else None),
-        "sources_used": (sources or ["yt-dlp"]) if result.get("links") else (sources or ["yt-dlp"]),
+        "sources_used": sources or ["none"],
         "response_time": f"{round(time.time() - started, 2)}s",
         "debug": debug if str(params.get("debug", "")).lower() in ("1", "true", "yes") else None,
         "timestamp_ist": now_ist("%d-%m-%Y %H:%M:%S"),
