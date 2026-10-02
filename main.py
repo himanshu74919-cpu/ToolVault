@@ -71,6 +71,44 @@ app.add_middleware(
 )
 
 
+class HeadSupportMiddleware:
+    """HEAD requests ko GET ki tarah handle karta hai (body ke bina).
+
+    Zaroori kyun hai: UptimeRobot / koi bhi uptime monitor HEAD request bhejta hai.
+    FastAPI ke @app.get routes par HEAD → "405 Method Not Allowed" aata tha,
+    jisse monitoring me server hamesha DOWN dikh raha tha.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http" and scope.get("method") == "HEAD":
+            scope = dict(scope, method="GET")
+
+            async def send_head(message):
+                if message["type"] == "http.response.start":
+                    headers = [
+                        (k, v) for k, v in message.get("headers", [])
+                        if k.lower() not in (b"content-length", b"transfer-encoding")
+                    ]
+                    headers.append((b"content-length", b"0"))
+                    await send({"type": "http.response.start",
+                                "status": message["status"], "headers": headers})
+                elif message["type"] == "http.response.body":
+                    await send({"type": "http.response.body",
+                                "body": b"", "more_body": False})
+                else:
+                    await send(message)
+
+            await self.app(scope, receive, send_head)
+        else:
+            await self.app(scope, receive, send)
+
+
+app.add_middleware(HeadSupportMiddleware)
+
+
 # =====================================================================
 # DATABASE (SQLite)
 # =====================================================================

@@ -994,3 +994,20 @@ response time ~1-4 second rehta hai. `?debug=1` lagane par poora diagnostic dikh
 ```
 ⚠️ Ye third-party public instances par depend karta hai — kabhi-kabhi down ho sakte hain.
 Isliye YouTube ko paid plan ka core feature banane ki jagah **bonus** rakhein.
+
+---
+
+# 🩺 UPTIMEROBOT "405 Method Not Allowed" — FIXED
+
+**Problem:** UptimeRobot (aur kai uptime monitors) `HEAD` request bhejte hain, jabki FastAPI ke
+`@app.get(...)` routes sirf `GET` allow karte the → server **405 Method Not Allowed** deta tha →
+monitor me site hamesha **DOWN** dikh rahi thi (server asal me chal raha tha).
+
+**Permanent fix (code me):** `HeadSupportMiddleware` — koi bhi `HEAD` request ko andar se `GET`
+ki tarah handle karta hai aur body-khali jawab deta hai (`content-length: 0`), status code wahi
+rehta hai (200 / 404 / 401 sab sahi). Isliye ab koi bhi monitor (HEAD ya GET) sahi status payega.
+
+**UptimeRobot setting (recommended):**
+- Monitor type: **HTTP(s)**
+- URL: `https://YOUR-URL.onrender.com/health`   ← halka endpoint, tez reply
+- Interval: 5 minute
