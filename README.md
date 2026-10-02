@@ -778,3 +778,138 @@ https://aapka-url.onrender.com/api/vehicle-report?key=Demo&number=BR30AR0802&for
   ke liye karein. Har report me likha hota hai: *"Verify from a second source"* /
   *"Confirm once on the official e-Challan / Parivahan site before paying anything."*
 * Challan payment hamesha **sarkari site** (Parivahan / echallan) par confirm kar ke hi karein.
+
+---
+
+# 🤝 RESELLER PANEL — dealers se API key bechwao (NEW)
+
+Aapke dealers/resellers khud API key bana sakte hain — aap control karte ho
+**kitna credit, kitne din tak, kaunse endpoints**.
+
+## Flow
+1. Dashboard → **🤝 Resellers** tab → naya reseller banao (username, password, credit, max days, endpoints).
+2. Dealer ko username/password do (ya wo khud login kare reseller box se).
+3. Dealer login karke **1 credit = 1 key** banata hai.
+4. Wo **apne credit se zyada**, **apne endpoints ke bahar** ya **max days se zyada** key nahi bana sakta.
+
+## Reseller API
+
+| Method | Endpoint | Kya karta hai |
+|---|---|---|
+| POST | `/reseller/login` | `{username,password}` → `{token}` |
+| GET | `/reseller/me` | apna credit + banaye gaye keys |
+| GET | `/reseller/keys` | sirf apne keys |
+| POST | `/reseller/keys` | naya key (`days`, `allowed_endpoints`, `customer`, `device_lock`) — 1 credit katega |
+| POST | `/reseller/keys/{id}/extend` | `{"days":10}` |
+| POST | `/reseller/keys/{id}/toggle` | enable / disable |
+
+Header: `X-Reseller-Token: <token>` ya `?token=<token>`
+
+**Example (dealer key banata hai):**
+```bash
+curl -X POST https://YOUR-URL.onrender.com/reseller/login \
+  -H 'Content-Type: application/json' -d '{"username":"dealer1","password":"dealer123"}'
+# {"success":true,"token":"..."}
+
+curl -X POST https://YOUR-URL.onrender.com/reseller/keys \
+  -H 'X-Reseller-Token: TOKEN' -H 'Content-Type: application/json' \
+  -d '{"days":30,"allowed_endpoints":"num-info,family","customer":"End Customer"}'
+# {"success":true,"api_key":"osint-XXXX","expires_at":"2026-11-01 23:32:07"}
+```
+
+Guard rails (live tested):
+- Plan se bahar endpoint → `{"success":false,"error":"Ye endpoints aapke plan me nahi hain"}`
+- Max days se upar → `{"success":false,"error":"Aap max 30 din ka key bana sakte ho"}`
+- Credit 0 → `402`
+- Galat password → `{"success":false,"error":"Galat username/password"}`
+
+## Admin reseller API (dashboard wahi use karta hai)
+`GET/POST /admin/resellers` · `POST /admin/resellers/{id}/credit {"amount":10}` ·
+`POST /admin/resellers/{id}/plan` · `POST /admin/resellers/{id}/toggle` · `DELETE /admin/resellers/{id}`
+(sab me header `x-admin-token: <admin password>`)
+
+---
+
+# 💸 UPI PAYMENT + AUTO KEY ACTIVATION (NEW)
+
+Customer aapki **landing page** se plan chunta hai → UPI payment →
+**payment aate hi key auto-activate** (ya aap manually approve kar do).
+
+## Public API
+
+| Method | Endpoint | Kya karta hai |
+|---|---|---|
+| GET | `/api/plans` | plans + price + UPI ID |
+| POST | `/api/create-order` | `{plan, name, phone}` → `order_code`, `upi_link`, `qr_url` |
+| GET | `/api/order-status?code=OSXXXX` | pending / **paid + api_key** |
+| POST | `/webhook/payment` | payment aane par order match → key activate |
+| POST | `/webhook/upi-sms` | UPI SMS text bhejein, amount/UTR parse hoga |
+
+**Order banao:**
+```bash
+curl -X POST https://YOUR-URL.onrender.com/api/create-order \
+  -H 'Content-Type: application/json' -d '{"plan":"num","name":"Rahul","phone":"9058390341"}'
+# {"order_code":"OSY5CNS6K3","amount":100.0,"upi_link":"upi://pay?pa=...&am=100&tn=OSY5CNS6K3",
+#  "qr_url":"https://api.qrserver.com/v1/create-qr-code/?...","status":"pending"}
+```
+
+**Payment aane par (webhook):**
+```bash
+curl -X POST https://YOUR-URL.onrender.com/webhook/payment \
+  -H 'Content-Type: application/json' \
+  -d '{"amount":100,"remark":"UPI/OSY5CNS6K3/payment","utr":"4321987654321","payer":"RAHUL"}'
+# {"success":true,"matched":true,"status":"paid","api_key":"osint-XXXX","expires_at":"..."}
+```
+- Order **remark/UTR me code** se match hota hai, warna **amount** se (jo bhi pending ho).
+- `x-webhook-secret` header set kar ke security on kar sakte ho (Settings → Webhook secret).
+- Manual approval: `POST /admin/orders/{id}/mark-paid` (Dashboard → **💸 Payments** → *Mark Paid*).
+
+## Default plans (Settings → Plans JSON se change kar sakte ho)
+| Plan | Price | Days | Endpoints |
+|---|---|---|---|
+| Trial | ₹29 | 3 | num-info, family |
+| Number Pack | ₹100 | 30 | num-info, family, num |
+| Vehicle Pack | ₹100 | 30 | vehicle-report, rc-info, challan |
+| Aadhaar Pack | ₹150 | 30 | aadhaar-family, aadhaar, ration |
+| Full Access | ₹299 | 30 | sab 59 |
+| Reseller | ₹999 | 365 | reseller panel credit |
+
+---
+
+# 🌐 LANDING PAGE — API bechne ki website (NEW, bina coding ke)
+
+Deploy hote hi **2 pages ready** milte hain:
+
+- **`https://YOUR-URL.onrender.com/site`** (ya `/store`) — poora selling website
+- **`https://YOUR-URL.onrender.com/dashboard`** — admin panel
+
+Site me kya hai:
+- Hero + plans grid (price, days, endpoints)
+- Order form → UPI QR + amount + **order code** (remark me dalna hai)
+- **Auto key delivery** — payment aate hi page khud key dikhata hai (8 second polling)
+- Live demo box (Demo key se try karo)
+- `/api/key-info` se "Check My Key"
+- Reseller CTA + Telegram support button
+- Footer: `⚡ Powered by @Supermannn_x`
+
+Settings tab me badal sakte ho: **UPI ID, UPI name, Telegram support, Website title, Tagline, Plans JSON**.
+
+---
+
+# 🤖 ADVANCED TELEGRAM BOT (NEW)
+
+File: `examples/telegram_bot_advanced.py`
+
+Features:
+- **Inline buttons menu** — /start dabao, sab kuch buttons se
+- **`/status`** — subscription check (plan, expiry, days left, usage, device)
+- **`/buy`** — plans inline → UPI QR → *"Paid — Check"* → **key mil jata hai bot me hi**
+- Force subscribe (`FORCE_CHANNEL = "@yourchannel"`)
+- Free text input (button dabane ke baad number/vehicle/etc. bhej do)
+
+Chalane ka tarika:
+```bash
+pip install requests
+python examples/telegram_bot_advanced.py
+```
+Config me sirf 3 cheezein: `BOT_TOKEN`, `API_BASE` (apna Render URL), `API_KEY`.

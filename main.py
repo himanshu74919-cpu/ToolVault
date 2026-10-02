@@ -27,6 +27,7 @@ import re
 import secrets
 import sqlite3
 import time
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
@@ -131,6 +132,7 @@ def init_db():
         conn.commit()
 
     migrate_db()
+    init_extra_tables()
 
     defaults = {
         "upstream_base": DEFAULT_UPSTREAM,
@@ -142,6 +144,13 @@ def init_db():
         "rate_limit_per_min": "120",
         "max_request_seconds": "50",
         "brand_tag": DEFAULT_BRAND,
+        "upi_id": os.environ.get("UPI_ID", ""),
+        "upi_name": os.environ.get("UPI_NAME", "OSINT API Hub"),
+        "telegram_support": DEFAULT_BRAND,
+        "store_title": "OSINT API Hub",
+        "store_tagline": "59 Powerful APIs — Number · Vehicle · Aadhaar · YouTube · Email",
+        "store_plans": "",
+        "webhook_secret": os.environ.get("WEBHOOK_SECRET", ""),
         "admin_password": ADMIN_PASSWORD,
         "github_token": GITHUB_TOKEN,
     }
@@ -3746,7 +3755,9 @@ async def admin_get_settings(request: Request):
     require_admin(request)
     keys = ["upstream_base", "upstream_key", "upstream_enabled", "demo_key_enabled",
             "cache_ttl", "cache_enabled", "rate_limit_per_min", "github_token",
-            "max_request_seconds", "brand_tag", "hibp_api_key"]
+            "max_request_seconds", "brand_tag", "hibp_api_key", "upi_id", "upi_name",
+            "telegram_support", "store_title", "store_tagline", "store_plans",
+            "webhook_secret"]
     return {"success": True, "settings": {k: get_setting(k, "") for k in keys}}
 
 
@@ -3757,7 +3768,9 @@ async def admin_save_settings(request: Request, payload: Dict[str, Any] = Body(d
     for k, v in data.items():
         if k in ("upstream_base", "upstream_key", "upstream_enabled", "demo_key_enabled",
                  "cache_ttl", "cache_enabled", "rate_limit_per_min", "github_token",
-                 "max_request_seconds", "brand_tag", "hibp_api_key", "admin_password"):
+                 "max_request_seconds", "brand_tag", "hibp_api_key", "admin_password",
+                 "upi_id", "upi_name", "telegram_support", "store_title", "store_tagline",
+                 "store_plans", "webhook_secret"):
             set_setting(k, str(v))
     return {"success": True}
 
@@ -3783,6 +3796,548 @@ async def admin_clear_logs(request: Request):
 # =====================================================================
 # PUBLIC META ENDPOINTS
 # =====================================================================
+# =====================================================================
+# RESELLERS  (dealers khud keys banayein)
+# =====================================================================
+def hash_pw(password: str) -> str:
+    return hashlib.sha256((str(password) + "osint-hub-salt").encode()).hexdigest()
+
+
+def init_extra_tables():
+    with db() as conn:
+        c = conn.cursor()
+        c.execute("""CREATE TABLE IF NOT EXISTS resellers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            name TEXT DEFAULT '',
+            telegram TEXT DEFAULT '',
+            is_active INTEGER DEFAULT 1,
+            max_days INTEGER DEFAULT 30,
+            allowed_endpoints TEXT DEFAULT '*',
+            credit INTEGER DEFAULT 0,
+            keys_created INTEGER DEFAULT 0,
+            created_at TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS reseller_tokens (
+            token TEXT PRIMARY KEY, reseller_id INTEGER, created_at TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_code TEXT UNIQUE,
+            customer_name TEXT DEFAULT '',
+            phone TEXT DEFAULT '',
+            plan_name TEXT DEFAULT '',
+            days INTEGER DEFAULT 30,
+            endpoints TEXT DEFAULT '*',
+            amount REAL DEFAULT 0,
+            status TEXT DEFAULT 'pending',
+            key_id INTEGER,
+            utr TEXT DEFAULT '',
+            payer TEXT DEFAULT '',
+            created_at TEXT,
+            paid_at TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            utr TEXT, amount REAL, remark TEXT, payer TEXT, raw TEXT,
+            order_id INTEGER, status TEXT DEFAULT 'unmatched', received_at TEXT
+        )""")
+        # api_keys extra columns
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(api_keys)")}
+        if "reseller_id" not in cols:
+            conn.execute("ALTER TABLE api_keys ADD COLUMN reseller_id INTEGER DEFAULT 0")
+        if "order_id" not in cols:
+            conn.execute("ALTER TABLE api_keys ADD COLUMN order_id INTEGER DEFAULT 0")
+        conn.commit()
+
+
+def make_key(name: str, days: int, endpoints: str, device_lock: int = 0, max_devices: int = 1,
+             customer: str = "", price: str = "", reseller_id: int = 0, order_id: int = 0,
+             rate_limit: int = 0, custom_key: str = "") -> Dict[str, Any]:
+    import string
+    alphabet = string.ascii_letters + string.digits
+    new_key = (custom_key or "").strip() or "osint-" + "".join(secrets.choice(alphabet) for _ in range(24))
+    expires_at = (datetime.now(IST) + timedelta(days=int(days))).strftime("%Y-%m-%d %H:%M:%S") if int(days) > 0 else None
+    with db() as conn:
+        if conn.execute("SELECT id FROM api_keys WHERE api_key=?", (new_key,)).fetchone():
+            return {"success": False, "error": "Key already exists"}
+        cur = conn.execute(
+            "INSERT INTO api_keys(api_key,name,note,is_active,requests,created_at,expires_at,"
+            "allowed_endpoints,device_lock,bound_devices,max_devices,rate_limit,customer,price,"
+            "reseller_id,order_id) VALUES(?,?,?,1,0,?,?,?,?,?,?,?,?,?,?,?)",
+            (new_key, name or customer, "", now_ist(), expires_at, endpoints or "*",
+             int(device_lock), "", max(1, int(max_devices)), int(rate_limit), customer or name,
+             str(price), int(reseller_id), int(order_id)))
+        conn.commit()
+        kid = cur.lastrowid
+    return {"success": True, "api_key": new_key, "id": kid, "expires_at": expires_at,
+            "days": int(days), "allowed_endpoints": endpoints or "*"}
+
+
+def reseller_by_token(token: str) -> Optional[Dict[str, Any]]:
+    if not token:
+        return None
+    with db() as conn:
+        row = conn.execute(
+            "SELECT r.* FROM reseller_tokens t JOIN resellers r ON r.id=t.reseller_id WHERE t.token=?",
+            (token,)).fetchone()
+    return dict(row) if row else None
+
+
+def endpoint_subset_ok(child: str, parent: str) -> bool:
+    if not parent or parent.strip() in ("*", "all", ""):
+        return True
+    allowed = {x.strip() for x in parent.split(",") if x.strip()}
+    wanted = {x.strip() for x in (child or "*").split(",") if x.strip()}
+    if "*" in wanted:
+        return False
+    return wanted.issubset(allowed)
+
+
+@app.post("/reseller/login")
+async def reseller_login(payload: Dict[str, Any] = Body(default={})):
+    username = (payload.get("username") or "").strip()
+    password = payload.get("password") or ""
+    with db() as conn:
+        row = conn.execute("SELECT * FROM resellers WHERE username=? AND password_hash=?",
+                           (username, hash_pw(password))).fetchone()
+    if not row:
+        return JSONResponse({"success": False, "error": "Galat username/password"}, status_code=401)
+    rec = dict(row)
+    if not int(rec.get("is_active") or 0):
+        return JSONResponse({"success": False, "error": "Ye reseller account band hai"}, status_code=403)
+    token = secrets.token_hex(24)
+    with db() as conn:
+        conn.execute("INSERT INTO reseller_tokens(token,reseller_id,created_at) VALUES(?,?,?)",
+                     (token, rec["id"], now_ist()))
+        conn.commit()
+    return {"success": True, "token": token,
+            "reseller": {"id": rec["id"], "username": rec["username"], "name": rec["name"],
+                         "credit": rec["credit"], "max_days": rec["max_days"],
+                         "allowed_endpoints": rec["allowed_endpoints"]}}
+
+
+def require_reseller(request: Request) -> Dict[str, Any]:
+    token = request.headers.get("x-reseller-token", "") or request.query_params.get("token", "")
+    rec = reseller_by_token(token)
+    if not rec:
+        raise HTTPException(status_code=401, detail="Reseller login required")
+    return rec
+
+
+@app.get("/reseller/me")
+async def reseller_me(request: Request):
+    rec = require_reseller(request)
+    with db() as conn:
+        row = conn.execute("SELECT * FROM resellers WHERE id=?", (rec["id"],)).fetchone()
+        keys = conn.execute("SELECT * FROM api_keys WHERE reseller_id=? ORDER BY id DESC LIMIT 200",
+                            (rec["id"],)).fetchall()
+    return {"success": True,
+            "reseller": {k: row[k] for k in ("id", "username", "name", "credit", "max_days",
+                                             "allowed_endpoints", "keys_created", "is_active")},
+            "keys": [_key_dict(k) for k in keys]}
+
+
+@app.get("/reseller/keys")
+async def reseller_keys(request: Request):
+    rec = require_reseller(request)
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM api_keys WHERE reseller_id=? ORDER BY id DESC LIMIT 200",
+                            (rec["id"],)).fetchall()
+    return {"success": True, "keys": [_key_dict(r) for r in rows],
+            "credit": rec.get("credit"), "max_days": rec.get("max_days")}
+
+
+@app.post("/reseller/keys")
+async def reseller_create_key(request: Request, payload: Dict[str, Any] = Body(default={})):
+    rec = require_reseller(request)
+    with db() as conn:
+        row = conn.execute("SELECT * FROM resellers WHERE id=?", (rec["id"],)).fetchone()
+    if not int(row["is_active"] or 0):
+        return JSONResponse({"success": False, "error": "Account disabled"}, status_code=403)
+    if int(row["credit"] or 0) <= 0:
+        return JSONResponse({"success": False,
+                             "error": "Credit khatam - admin se credit lein (1 key = 1 credit)"},
+                            status_code=402)
+    days = int(payload.get("days") or 30)
+    if days > int(row["max_days"] or 30):
+        return JSONResponse({"success": False,
+                             "error": f"Aap max {row['max_days']} din ka key bana sakte ho"},
+                            status_code=403)
+    endpoints = (payload.get("allowed_endpoints") or "*").strip()
+    if not endpoint_subset_ok(endpoints, row["allowed_endpoints"]):
+        return JSONResponse({"success": False,
+                             "error": "Ye endpoints aapke plan me nahi hain",
+                             "your_endpoints": row["allowed_endpoints"]}, status_code=403)
+    result = make_key(name=payload.get("name") or payload.get("customer") or "", days=days,
+                      endpoints=endpoints, device_lock=int(payload.get("device_lock") or 0),
+                      max_devices=int(payload.get("max_devices") or 1),
+                      customer=payload.get("customer") or payload.get("name") or "",
+                      price=str(payload.get("price") or ""), reseller_id=int(row["id"]))
+    if result.get("success"):
+        with db() as conn:
+            conn.execute("UPDATE resellers SET credit=credit-1, keys_created=keys_created+1 WHERE id=?",
+                         (row["id"],))
+            conn.commit()
+    return result
+
+
+@app.post("/reseller/keys/{key_id}/extend")
+async def reseller_extend_key(key_id: int, request: Request,
+                              payload: Dict[str, Any] = Body(default={})):
+    rec = require_reseller(request)
+    days = int(payload.get("days") or 30)
+    if days > int(rec.get("max_days") or 30):
+        return JSONResponse({"success": False, "error": f"Max {rec.get('max_days')} din allowed"},
+                            status_code=403)
+    with db() as conn:
+        row = conn.execute("SELECT * FROM api_keys WHERE id=? AND reseller_id=?",
+                           (key_id, rec["id"])).fetchone()
+        if not row:
+            return JSONResponse({"success": False, "error": "Key nahi mili"}, status_code=404)
+        current = row["expires_at"]
+        base = datetime.now(IST).replace(tzinfo=None)
+        if current:
+            try:
+                old = datetime.strptime(current, "%Y-%m-%d %H:%M:%S")
+                if old > base:
+                    base = old
+            except Exception:
+                pass
+        new_expiry = (base + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute("UPDATE api_keys SET expires_at=?, is_active=1 WHERE id=?", (new_expiry, key_id))
+        conn.commit()
+    return {"success": True, "expires_at": new_expiry}
+
+
+@app.post("/reseller/keys/{key_id}/toggle")
+async def reseller_toggle_key(key_id: int, request: Request):
+    rec = require_reseller(request)
+    with db() as conn:
+        conn.execute("UPDATE api_keys SET is_active = CASE WHEN is_active=1 THEN 0 ELSE 1 END "
+                     "WHERE id=? AND reseller_id=?", (key_id, rec["id"]))
+        conn.commit()
+    return {"success": True}
+
+
+# ---------- admin: resellers ----------
+@app.get("/admin/resellers")
+async def admin_list_resellers(request: Request):
+    require_admin(request)
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM resellers ORDER BY id DESC").fetchall()
+    return {"success": True, "resellers": [dict(r) for r in rows]}
+
+
+@app.post("/admin/resellers")
+async def admin_create_reseller(request: Request, payload: Dict[str, Any] = Body(default={})):
+    require_admin(request)
+    username = (payload.get("username") or "").strip().lower()
+    password = payload.get("password") or ""
+    if not username or not password:
+        return JSONResponse({"success": False, "error": "username + password chahiye"}, status_code=400)
+    with db() as conn:
+        if conn.execute("SELECT id FROM resellers WHERE username=?", (username,)).fetchone():
+            return JSONResponse({"success": False, "error": "Username already exists"}, status_code=400)
+        conn.execute("INSERT INTO resellers(username,password_hash,name,telegram,is_active,max_days,"
+                     "allowed_endpoints,credit,keys_created,created_at) VALUES(?,?,?,?,1,?,?,?,0,?)",
+                     (username, hash_pw(password), payload.get("name", ""),
+                      payload.get("telegram", ""), int(payload.get("max_days") or 30),
+                      (payload.get("allowed_endpoints") or "*").strip() or "*",
+                      int(payload.get("credit") or 0), now_ist()))
+        conn.commit()
+    return {"success": True, "username": username, "password": password,
+            "credit": int(payload.get("credit") or 0)}
+
+
+@app.post("/admin/resellers/{rid}/credit")
+async def admin_reseller_credit(rid: int, request: Request,
+                                payload: Dict[str, Any] = Body(default={})):
+    require_admin(request)
+    amount = int(payload.get("amount") or 0)
+    with db() as conn:
+        conn.execute("UPDATE resellers SET credit=credit+? WHERE id=?", (amount, rid))
+        conn.commit()
+        row = conn.execute("SELECT credit FROM resellers WHERE id=?", (rid,)).fetchone()
+    return {"success": True, "credit": row["credit"] if row else 0}
+
+
+@app.post("/admin/resellers/{rid}/plan")
+async def admin_reseller_plan(rid: int, request: Request,
+                              payload: Dict[str, Any] = Body(default={})):
+    require_admin(request)
+    with db() as conn:
+        if payload.get("max_days") is not None:
+            conn.execute("UPDATE resellers SET max_days=? WHERE id=?",
+                         (int(payload["max_days"]), rid))
+        if payload.get("allowed_endpoints") is not None:
+            conn.execute("UPDATE resellers SET allowed_endpoints=? WHERE id=?",
+                         ((payload["allowed_endpoints"] or "*").strip() or "*", rid))
+        conn.commit()
+    return {"success": True}
+
+
+@app.post("/admin/resellers/{rid}/toggle")
+async def admin_reseller_toggle(rid: int, request: Request):
+    require_admin(request)
+    with db() as conn:
+        conn.execute("UPDATE resellers SET is_active = CASE WHEN is_active=1 THEN 0 ELSE 1 END WHERE id=?",
+                     (rid,))
+        conn.commit()
+    return {"success": True}
+
+
+@app.delete("/admin/resellers/{rid}")
+async def admin_delete_reseller(rid: int, request: Request):
+    require_admin(request)
+    with db() as conn:
+        conn.execute("DELETE FROM resellers WHERE id=?", (rid,))
+        conn.commit()
+    return {"success": True}
+
+
+# =====================================================================
+# ORDERS + UPI PAYMENTS (auto key activation)
+# =====================================================================
+def gen_order_code() -> str:
+    return "OS" + "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(8))
+
+
+def store_plans() -> List[Dict[str, Any]]:
+    raw = get_setting("store_plans", "")
+    if raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list) and data:
+                return data
+        except Exception:
+            pass
+    return [
+        {"id": "trial", "name": "Trial Pack", "days": 3, "endpoints": "num-info,family",
+         "price": 29, "description": "3 din · Number + Family API"},
+        {"id": "num", "name": "Number Pack", "days": 30, "endpoints": "num-info,family,num,number-info",
+         "price": 100, "description": "30 din · Number + Family report"},
+        {"id": "vehicle", "name": "Vehicle Pack", "days": 30,
+         "endpoints": "vehicle-report,vehicle-full,rc-info,vehicle-rc,vehicle-challan",
+         "price": 100, "description": "30 din · RC + Challan full report"},
+        {"id": "aadhaar", "name": "Aadhaar Pack", "days": 30,
+         "endpoints": "aadhaar-family,aadhaar,ration",
+         "price": 150, "description": "30 din · Aadhaar family intel"},
+        {"id": "full", "name": "Full Access", "days": 30, "endpoints": "*",
+         "price": 299, "description": "30 din · SARE 59 endpoints"},
+        {"id": "reseller", "name": "Reseller Pack", "days": 365, "endpoints": "*",
+         "price": 999, "description": "1 saal · Full access (resale allowed)"},
+    ]
+
+
+@app.get("/api/plans")
+async def api_plans():
+    upi = get_setting("upi_id", "") or ""
+    return {"success": True, "upi_id": upi, "upi_name": get_setting("upi_name", "") or "OSINT API Hub",
+            "support": get_setting("telegram_support", "") or brand(),
+            "brand": brand(), "plans": store_plans()}
+
+
+@app.post("/api/create-order")
+async def api_create_order(request: Request, payload: Dict[str, Any] = Body(default={})):
+    """Customer plan chunta hai → order banta hai + UPI link/QR milta hai."""
+    plan_id = (payload.get("plan") or payload.get("plan_id") or "").strip()
+    plans = store_plans()
+    plan = next((p for p in plans if p.get("id") == plan_id), None)
+    if not plan and payload.get("days"):
+        plan = {"id": "custom", "name": payload.get("plan_name") or "Custom Plan",
+                "days": int(payload.get("days") or 30),
+                "endpoints": (payload.get("endpoints") or "*").strip(),
+                "price": float(payload.get("amount") or 0)}
+    if not plan:
+        return JSONResponse({"success": False, "error": "Plan nahi mila", "available": plans},
+                            status_code=400)
+    amount = float(payload.get("amount") or plan.get("price") or 0)
+    code = gen_order_code()
+    with db() as conn:
+        cur = conn.execute("INSERT INTO orders(order_code,customer_name,phone,plan_name,days,endpoints,"
+                           "amount,status,created_at) VALUES(?,?,?,?,?,?,?,'pending',?)",
+                           (code, (payload.get("name") or "")[:120], (payload.get("phone") or "")[:40],
+                            plan.get("name", ""), int(plan.get("days") or 30),
+                            (plan.get("endpoints") or "*"), amount, now_ist()))
+        conn.commit()
+        oid = cur.lastrowid
+    upi_id = get_setting("upi_id", "") or ""
+    upi_name = get_setting("upi_name", "") or "OSINT API Hub"
+    upi_link = (f"upi://pay?pa={urllib.parse.quote(upi_id)}&pn={urllib.parse.quote(upi_name)}"
+                f"&am={amount}&cu=INR&tn={code}") if upi_id else ""
+    qr_url = (f"https://api.qrserver.com/v1/create-qr-code/?size=320x320&data="
+              f"{urllib.parse.quote(upi_link)}") if upi_link else ""
+    return {"success": True, "order_code": code, "order_id": oid,
+            "plan": plan.get("name"), "days": int(plan.get("days") or 30),
+            "endpoints": plan.get("endpoints"), "amount": amount,
+            "upi_id": upi_id, "upi_link": upi_link, "qr_url": qr_url,
+            "status": "pending",
+            "message": (f"₹{amount} UPI ID {upi_id} par bhejein, remark/notes me ye code zaroor "
+                        f"likhein: {code}"),
+            "check_url": f"/api/order-status?code={code}",
+            "powered_by": brand()}
+
+
+@app.get("/api/order-status")
+async def api_order_status(code: str = ""):
+    code = (code or "").strip().upper()
+    if not code:
+        return JSONResponse({"success": False, "error": "order code chahiye"}, status_code=400)
+    with db() as conn:
+        row = conn.execute("SELECT * FROM orders WHERE order_code=?", (code,)).fetchone()
+        if not row:
+            return JSONResponse({"success": False, "error": "Order nahi mila"}, status_code=404)
+        api_key = ""
+        if row["key_id"]:
+            k = conn.execute("SELECT api_key FROM api_keys WHERE id=?", (row["key_id"],)).fetchone()
+            if k:
+                api_key = k["api_key"]
+    return {"success": True, "order_code": code, "status": row["status"],
+            "plan": row["plan_name"], "days": row["days"], "amount": row["amount"],
+            "created_at": row["created_at"], "paid_at": row["paid_at"], "utr": row["utr"],
+            "api_key": api_key if row["status"] == "paid" else "",
+            "powered_by": brand()}
+
+
+def find_pending_order(remark: str, amount: float) -> Optional[sqlite3.Row]:
+    remark = (remark or "").upper()
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM orders WHERE status='pending' ORDER BY id").fetchall()
+    for row in rows:
+        if row["order_code"] and row["order_code"].upper() in remark:
+            return row
+    try:
+        amt = float(amount or 0)
+    except Exception:
+        amt = 0
+    if amt > 0:
+        for row in rows:
+            try:
+                if abs(float(row["amount"]) - amt) < 1:
+                    return row
+            except Exception:
+                continue
+    return None
+
+
+def activate_order(order: sqlite3.Row, utr: str = "", payer: str = "") -> Dict[str, Any]:
+    result = make_key(name=order["customer_name"] or "Customer", days=int(order["days"] or 30),
+                      endpoints=order["endpoints"] or "*", device_lock=0, max_devices=1,
+                      customer=order["customer_name"] or "Customer",
+                      price=str(order["amount"]), order_id=int(order["id"]))
+    if not result.get("success"):
+        return result
+    with db() as conn:
+        conn.execute("UPDATE orders SET status='paid', key_id=?, utr=?, payer=?, paid_at=? WHERE id=?",
+                     (result["id"], utr, payer, now_ist(), order["id"]))
+        conn.commit()
+    return {"success": True, "order_code": order["order_code"], "status": "paid",
+            "api_key": result["api_key"], "expires_at": result["expires_at"],
+            "days": result["days"], "plan": order["plan_name"],
+            "customer": order["customer_name"]}
+
+
+@app.post("/webhook/payment")
+async def webhook_payment(request: Request, payload: Dict[str, Any] = Body(default={})):
+    """UPI payment aate hi key auto-activate.
+    Body: {"utr":"...", "amount":100, "remark":"OSXXXXXXXX", "payer":"NAME", "raw":"sms text"}
+    """
+    secret = get_setting("webhook_secret", "")
+    if secret:
+        provided = request.headers.get("x-webhook-secret", "") or payload.get("secret", "")
+        if provided != secret:
+            return JSONResponse({"success": False, "error": "invalid webhook secret"}, status_code=401)
+    amount = float(payload.get("amount") or 0)
+    remark = str(payload.get("remark") or payload.get("note") or payload.get("tn") or "")
+    utr = str(payload.get("utr") or payload.get("ref") or "")
+    payer = str(payload.get("payer") or payload.get("from") or "")
+    raw = str(payload.get("raw") or payload.get("sms") or "")
+
+    order = find_pending_order(remark or raw, amount)
+    with db() as conn:
+        cur = conn.execute("INSERT INTO payments(utr,amount,remark,payer,raw,order_id,status,received_at)"
+                           " VALUES(?,?,?,?,?,?,?,?)",
+                           (utr, amount, remark, payer, raw,
+                            int(order["id"]) if order else 0,
+                            "matched" if order else "unmatched", now_ist()))
+        conn.commit()
+        pid = cur.lastrowid
+    if not order:
+        return {"success": True, "matched": False, "payment_id": pid,
+                "message": "Payment save ho gaya, koi pending order match nahi hua "
+                           "(admin dashboard se manually claim kar sakte ho)"}
+    result = activate_order(order, utr=utr, payer=payer)
+    result["matched"] = True
+    result["payment_id"] = pid
+    return result
+
+
+UPI_SMS_PATTERNS = [
+    r"(?:rs\.?|inr|₹)\s*([\d,]+(?:\.\d{1,2})?)",
+    r"(?:upi[/ ]?ref(?:erence)?\s*(?:no|number)?[:.]?\s*)(\d{6,20})",
+    r"(?:ref no|refno|utr)[:.]?\s*([A-Za-z0-9]{6,25})",
+]
+
+
+@app.post("/webhook/upi-sms")
+async def webhook_upi_sms(request: Request, payload: Dict[str, Any] = Body(default={})):
+    """Android SMS forwarder (Macrodroid/Tasker/HTTP Shortcuts) se raw SMS bhejein."""
+    sms = str(payload.get("sms") or payload.get("text") or payload.get("message") or "")
+    if not sms:
+        return JSONResponse({"success": False, "error": "sms text chahiye"}, status_code=400)
+    low = sms.lower()
+    if "credited" not in low and "received" not in low:
+        return {"success": True, "ignored": True, "message": "Credit SMS nahi lag raha"}
+    amount = 0.0
+    m = re.search(UPI_SMS_PATTERNS[0], low)
+    if m:
+        try:
+            amount = float(m.group(1).replace(",", ""))
+        except Exception:
+            amount = 0.0
+    utr = ""
+    for pat in UPI_SMS_PATTERNS[1:]:
+        mm = re.search(pat, sms, flags=re.I)
+        if mm:
+            utr = mm.group(1)
+            break
+    payer = ""
+    pm = re.search(r"(?:from|by)\s+([A-Z][A-Za-z .]{2,40})", sms)
+    if pm:
+        payer = pm.group(1).strip()
+    return await webhook_payment(request, {"amount": amount, "remark": sms.upper(), "utr": utr,
+                                           "payer": payer, "raw": sms})
+
+
+@app.post("/admin/orders/{oid}/mark-paid")
+async def admin_mark_paid(oid: int, request: Request, payload: Dict[str, Any] = Body(default={})):
+    require_admin(request)
+    with db() as conn:
+        row = conn.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+        if not row:
+            return JSONResponse({"success": False, "error": "Order nahi mila"}, status_code=404)
+        if row["status"] == "paid":
+            return {"success": True, "already": True, "order_code": row["order_code"]}
+    result = activate_order(row, utr=str(payload.get("utr") or "MANUAL"),
+                            payer=str(payload.get("payer") or "manual"))
+    return result
+
+
+@app.get("/admin/orders")
+async def admin_orders(request: Request, status: str = ""):
+    require_admin(request)
+    with db() as conn:
+        if status:
+            rows = conn.execute("SELECT * FROM orders WHERE status=? ORDER BY id DESC LIMIT 200",
+                                (status,)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM orders ORDER BY id DESC LIMIT 200").fetchall()
+        pays = conn.execute("SELECT * FROM payments ORDER BY id DESC LIMIT 100").fetchall()
+    return {"success": True, "orders": [dict(r) for r in rows], "payments": [dict(p) for p in pays]}
+
+
 @app.get("/api/endpoints")
 async def list_endpoints(request: Request):
     base = str(request.base_url).rstrip("/")
@@ -3856,6 +4411,255 @@ async def legacy_search(q: str = "", limit: int = 50):
             "SELECT * FROM custom_records WHERE key_value LIKE ? OR data LIKE ? LIMIT ?",
             (f"%{q}%", f"%{q}%", min(limit, 500))).fetchall()
     return {"success": True, "query": q, "count": len(rows), "results": [dict(r) for r in rows]}
+
+
+# =====================================================================
+# CUSTOM LANDING PAGE (API bechne ke liye website)
+# =====================================================================
+STORE_HTML = r"""<!DOCTYPE html>
+<html lang="hi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>
+:root{--bg:#0b0f16;--panel:#141a24;--line:#263041;--text:#e8eef7;--muted:#93a1b5;
+--acc:#4f8cff;--green:#2ecc71;--gold:#ffc93c;--pink:#ff5c8a}
+*{box-sizing:border-box}
+body{margin:0;background:radial-gradient(1200px 600px at 50% -10%,#1b3a6b 0%,transparent 60%),var(--bg);
+color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;font-size:17px;line-height:1.6}
+.wrap{max-width:1000px;margin:0 auto;padding:18px}
+header{padding:34px 18px 24px;text-align:center}
+h1{margin:0;font-size:30px;letter-spacing:.5px}
+.tag{color:var(--muted);margin-top:8px;font-size:16px}
+.badge{display:inline-block;background:#1c2b45;border:1px solid var(--line);color:#9ec5ff;
+border-radius:30px;padding:6px 14px;font-size:13px;margin:6px 4px 0}
+.hero{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-top:18px}
+.btn{background:var(--acc);color:#fff;border:none;border-radius:12px;padding:14px 22px;font-size:17px;
+font-weight:700;cursor:pointer;text-decoration:none;display:inline-block}
+.btn.ghost{background:transparent;border:1px solid var(--line);color:var(--text)}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:18px;margin:16px 0}
+h2{font-size:21px;margin:0 0 6px}
+.grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(250px,1fr))}
+.plan{border:1px solid var(--line);border-radius:14px;padding:16px;background:#101722;position:relative}
+.plan.pop{border-color:var(--gold);box-shadow:0 0 0 1px #ffc93c55}
+.plan h3{margin:0 0 4px;font-size:19px}
+.price{font-size:28px;font-weight:800;color:var(--gold)}
+.price small{font-size:15px;color:var(--muted);font-weight:500}
+.plan ul{padding-left:18px;margin:10px 0 14px;color:var(--muted);font-size:15px}
+input,select{width:100%;background:#0c121b;color:var(--text);border:1px solid var(--line);
+border-radius:11px;padding:13px;font-size:16px;margin:6px 0}
+label{font-size:13px;color:var(--muted);display:block;margin-top:8px}
+.paybox{background:#0c121b;border:1px dashed var(--line);border-radius:14px;padding:16px;margin-top:12px}
+.code{font-family:ui-monospace,Menlo,monospace;background:#1b2534;border-radius:8px;padding:6px 10px;
+display:inline-block;font-size:15px;letter-spacing:1px}
+.qr{max-width:260px;width:100%;border-radius:12px;background:#fff;padding:8px;margin:10px auto;display:block}
+pre{background:#0c121b;border:1px solid var(--line);border-radius:12px;padding:12px;overflow:auto;
+white-space:pre-wrap;font-size:14px;max-height:320px}
+.ok{color:var(--green)}.warn{color:var(--gold)}.bad{color:var(--pink)}
+footer{text-align:center;color:var(--muted);font-size:14px;padding:30px 12px 50px}
+a{color:#9ec5ff}
+.step{display:flex;gap:10px;align-items:flex-start;margin:8px 0}
+.num{background:#1c2b45;border-radius:50%;width:28px;height:28px;min-width:28px;display:flex;
+align-items:center;justify-content:center;font-weight:700;font-size:14px}
+</style>
+</head>
+<body>
+<header>
+  <h1>__TITLE__</h1>
+  <div class="tag">__TAGLINE__</div>
+  <div>
+    <span class="badge">⚡ Powered by __BRAND__</span>
+    <span class="badge">🔑 Instant key after UPI payment</span>
+    <span class="badge">🤝 Reseller program</span>
+  </div>
+  <div class="hero">
+    <a class="btn" href="#buy">🛒 Buy API Key</a>
+    <a class="btn ghost" href="#demo">🔍 Live Demo</a>
+    <a class="btn ghost" href="#check">🔑 Check My Key</a>
+    <a class="btn ghost" href="__SUPPORT_LINK__">💬 Telegram Support</a>
+  </div>
+</header>
+
+<div class="wrap">
+
+<div class="card" id="buy">
+  <h2>💎 Plans &amp; Pricing</h2>
+  <div class="grid" id="plans"></div>
+
+  <h2 style="margin-top:22px">🧾 Order banao</h2>
+  <label>Plan</label>
+  <select id="planSel" onchange="planChanged()"></select>
+  <label>Aapka naam</label>
+  <input id="custName" placeholder="Rohit Kumar">
+  <label>WhatsApp / Phone (optional)</label>
+  <input id="custPhone" placeholder="919973700984">
+  <button class="btn" style="margin-top:12px;width:100%" onclick="createOrder()">💳 Pay &amp; Get Key</button>
+
+  <div class="paybox" id="paybox" style="display:none">
+    <div id="payInfo"></div>
+    <img class="qr" id="qrImg" alt="UPI QR">
+    <div style="text-align:center;margin:8px 0">
+      <a class="btn" id="upiBtn" href="#">📲 Pay via UPI App</a>
+    </div>
+    <div class="step"><div class="num">1</div><div>UPI app se payment karein (QR scan ya button)</div></div>
+    <div class="step"><div class="num">2</div><div>Remark/Notes me ye code zaroor likhein:<br>
+      <span class="code" id="orderCode"></span>
+      <button class="btn ghost" style="padding:6px 12px;font-size:14px;margin-left:6px" onclick="copyCode()">📋 Copy</button>
+    </div></div>
+    <div class="step"><div class="num">3</div><div>Payment ke turant baad key yahin aa jayegi (auto)</div></div>
+    <div id="statusLine" style="margin-top:10px;font-weight:600"></div>
+    <div id="keyBox"></div>
+  </div>
+</div>
+
+<div class="card" id="demo">
+  <h2>🔍 Live Demo (Demo key se)</h2>
+  <label>Kya check karna hai</label>
+  <select id="demoEp" onchange="demoChanged()">
+    <option value="num-info|q|919973700984">Number Info</option>
+    <option value="vehicle-report|number|BR30AR0802">Vehicle RC + Challan</option>
+    <option value="family|q|919973700984">Family / Linked Numbers</option>
+    <option value="aadhaar-family|aadhaar|861313813129">Aadhaar Family</option>
+    <option value="email-info|email|test@gmail.com">Email OSINT</option>
+    <option value="pass-check|password|Katihar@123">Password Breach Check</option>
+    <option value="youtube-download|url|https://youtube.com/watch?v=X8X-XyK4CYE">YouTube Download</option>
+  </select>
+  <label>Value</label>
+  <input id="demoVal" value="919973700984">
+  <button class="btn" style="margin-top:10px;width:100%" onclick="runDemo()">▶ Try Now</button>
+  <pre id="demoOut">Yahan live result aayega…</pre>
+</div>
+
+<div class="card" id="check">
+  <h2>🔑 Apni key check karein</h2>
+  <input id="keyCheck" placeholder="osint-xxxxxxxxxxxx">
+  <button class="btn" style="margin-top:10px;width:100%" onclick="checkKey()">Check Status</button>
+  <pre id="keyOut">Expiry, plan aur usage yahan dikhega…</pre>
+</div>
+
+<div class="card">
+  <h2>🤝 Reseller banein</h2>
+  <p style="color:var(--muted);margin-top:0">Apne dealers/resellers ke liye alag panel hai — wo khud
+  keys bana sakte hain (aap credit control karte hain).</p>
+  <a class="btn ghost" href="/dashboard">Admin / Reseller Login</a>
+  <a class="btn ghost" href="__SUPPORT_LINK__">Reseller slot ke liye contact</a>
+</div>
+
+</div>
+
+<footer>
+  ⚡ Powered by <b>__BRAND__</b> · API Developer / Telegram: <b>__BRAND__</b><br>
+  <span style="font-size:13px">Data sirf verification ke liye — challan payment hamesha sarkari site par confirm karein.</span>
+</footer>
+
+<script>
+const PLANS = __PLANS__;
+const BRAND = "__BRAND__";
+let currentOrder = null, pollTimer = null;
+
+function renderPlans(){
+  document.getElementById('plans').innerHTML = PLANS.map((p,i)=>
+    '<div class="plan '+(i===1?'pop':'')+'"><h3>'+p.name+(i===1?' 🌟':'')+'</h3>'+
+    '<div class="price">₹'+p.price+' <small>/ '+p.days+' din</small></div>'+
+    '<ul><li>'+p.description+'</li><li>Endpoints: '+(p.endpoints==='*'?'SAB (59)':p.endpoints.split(',').length+' APIs')+'</li>'+
+    '<li>Instant activation · Device lock option</li></ul></div>').join('');
+  const sel = document.getElementById('planSel');
+  sel.innerHTML = PLANS.map(p=>'<option value="'+p.id+'">'+p.name+' — ₹'+p.price+' / '+p.days+' din</option>').join('');
+}
+function planChanged(){}
+function demoChanged(){
+  const v = document.getElementById('demoEp').value.split('|');
+  document.getElementById('demoVal').value = v[2];
+}
+async function createOrder(){
+  const payload = {plan: document.getElementById('planSel').value,
+                   name: document.getElementById('custName').value,
+                   phone: document.getElementById('custPhone').value};
+  const r = await fetch('/api/create-order',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(payload)});
+  const j = await r.json();
+  if(!j.success){ alert(j.error||'Error'); return; }
+  currentOrder = j;
+  document.getElementById('paybox').style.display='';
+  document.getElementById('orderCode').textContent = j.order_code;
+  document.getElementById('payInfo').innerHTML =
+    '<b>'+j.plan+'</b> · ₹'+j.amount+' · '+j.days+' din<br>'+
+    'UPI ID: <span class="code">'+j.upi_id+'</span>';
+  if(j.qr_url){ document.getElementById('qrImg').src = j.qr_url; }
+  document.getElementById('upiBtn').href = j.upi_link || '#';
+  document.getElementById('statusLine').innerHTML = '<span class="warn">⏳ Payment ka intezaar…</span>';
+  document.getElementById('keyBox').innerHTML = '';
+  if(pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(pollOrder, 8000);
+  pollOrder();
+}
+function copyCode(){
+  navigator.clipboard.writeText(currentOrder.order_code);
+  alert('Code copy ho gaya: '+currentOrder.order_code);
+}
+async function pollOrder(){
+  if(!currentOrder) return;
+  const r = await fetch('/api/order-status?code='+currentOrder.order_code);
+  const j = await r.json();
+  if(j.status==='paid'){
+    clearInterval(pollTimer);
+    document.getElementById('statusLine').innerHTML = '<span class="ok">✅ Payment mil gaya — key active!</span>';
+    document.getElementById('keyBox').innerHTML =
+      '<pre>🔑 Aapki API KEY:\n'+j.api_key+'\n\n📦 Plan: '+j.plan+
+      '\n⏳ Valid: '+j.days+' din\n💰 Paid: ₹'+j.amount+'\n\n'+
+      'Example:\n'+location.origin+'/api/num-info?key='+j.api_key+'&q=919973700984&format=text</pre>';
+  }
+}
+async function runDemo(){
+  const parts = document.getElementById('demoEp').value.split('|');
+  const ep = parts[0], pname = parts[1];
+  const val = document.getElementById('demoVal').value;
+  const url = '/api/'+ep+'?key=Demo&'+pname+'='+encodeURIComponent(val)+'&format=text';
+  document.getElementById('demoOut').textContent='Loading…';
+  try{
+    const r = await fetch(url);
+    document.getElementById('demoOut').textContent = await r.text();
+  }catch(e){ document.getElementById('demoOut').textContent='Error: '+e.message; }
+}
+async function checkKey(){
+  const k = document.getElementById('keyCheck').value.trim();
+  if(!k){ return; }
+  const r = await fetch('/api/key-info?key='+encodeURIComponent(k));
+  const j = await r.json();
+  document.getElementById('keyOut').textContent = JSON.stringify(j,null,2);
+}
+renderPlans();
+</script>
+</body>
+</html>
+"""
+
+
+def render_store(request: Request) -> HTMLResponse:
+    title = get_setting("store_title", "OSINT API Hub") or "OSINT API Hub"
+    tagline = get_setting("store_tagline", "") or "59 Powerful APIs"
+    support = get_setting("telegram_support", "") or brand()
+    support_link = (f"https://t.me/{support.lstrip('@')}" if support.startswith("@")
+                    else (support if support.startswith("http") else "#"))
+    plans = store_plans()
+    html = (STORE_HTML
+            .replace("__TITLE__", title)
+            .replace("__TAGLINE__", tagline)
+            .replace("__BRAND__", brand())
+            .replace("__SUPPORT_LINK__", support_link)
+            .replace("__PLANS__", json.dumps(plans, ensure_ascii=False)))
+    return HTMLResponse(html)
+
+
+@app.get("/site")
+async def site(request: Request):
+    return render_store(request)
+
+
+@app.get("/store")
+async def store_alias(request: Request):
+    return render_store(request)
 
 
 # =====================================================================
@@ -3940,6 +4744,8 @@ a{color:#79c0ff}
   <button class="active" data-tab="endpoints">🔌 Endpoints</button>
   <button data-tab="database">🗄️ Database</button>
   <button data-tab="keys">🔑 API Keys</button>
+  <button data-tab="resellers">🤝 Resellers</button>
+  <button data-tab="payments">💸 Payments</button>
   <button data-tab="logs">📊 Logs</button>
   <button data-tab="settings">⚙️ Settings</button>
   <button data-tab="help">📖 Help</button>
@@ -4101,6 +4907,69 @@ a{color:#79c0ff}
   </div>
 </div>
 
+<!-- RESELLERS -->
+<div id="tab-resellers" class="hidden">
+  <div class="card">
+    <h2>🤝 Naya Reseller / Dealer</h2>
+    <div class="row">
+      <div><label>Username</label><input id="rsUser" placeholder="dealer1"></div>
+      <div><label>Password</label><input id="rsPass" placeholder="dealer123"></div>
+    </div>
+    <div class="row">
+      <div><label>Naam</label><input id="rsName" placeholder="Rohit dealer"></div>
+      <div><label>Telegram</label><input id="rsTg" placeholder="@dealer"></div>
+    </div>
+    <div class="row">
+      <div><label>Credit (1 key = 1 credit)</label><input id="rsCredit" type="number" value="10"></div>
+      <div><label>Max days (kitne din ka key bech sakta hai)</label><input id="rsMaxDays" type="number" value="30"></div>
+    </div>
+    <div class="row"><div><label>Endpoints (comma separated, * = sab)</label>
+      <input id="rsEndpoints" value="*"></div></div>
+    <button class="action" onclick="createReseller()">Create Reseller</button>
+  </div>
+  <div class="card">
+    <h2>📋 Resellers</h2>
+    <button class="ghost small" onclick="loadResellers()">Refresh</button>
+    <div id="rsList" style="margin-top:10px"></div>
+  </div>
+  <div class="card">
+    <h2>🔐 Reseller Panel (dealers ke liye)</h2>
+    <p style="color:var(--muted);margin-top:0">Dealer apna username/password yahan daal kar apne keys
+    khud bana sakta hai (sirf uske credit aur endpoints ke andar).</p>
+    <div class="row">
+      <div><label>Username</label><input id="rsLoginUser"></div>
+      <div><label>Password</label><input id="rsLoginPass" type="password"></div>
+    </div>
+    <button class="action" onclick="resellerLogin()">Login</button>
+    <button class="ghost" onclick="loadResellerKeys()">Mere Keys</button>
+    <div id="rsPanel" style="margin-top:12px"></div>
+  </div>
+</div>
+
+<!-- PAYMENTS -->
+<div id="tab-payments" class="hidden">
+  <div class="card">
+    <h2>💸 UPI Orders &amp; Payments</h2>
+    <p style="color:var(--muted);margin-top:0">
+      Customer <b>/site</b> page se order banata hai → UPI payment → webhook se <b>key auto-activate</b>.
+      Manual approval bhi yahin se kar sakte ho.
+    </p>
+    <button class="action" onclick="loadOrders()">Refresh</button>
+    <a class="ghost" style="padding:13px 18px;border-radius:12px;text-decoration:none;display:inline-block"
+       href="/site" target="_blank">🌐 Landing Page kholo</a>
+    <div id="paySummary" style="margin:10px 0"></div>
+    <div id="orderList" style="margin-top:10px"></div>
+  </div>
+  <div class="card">
+    <h2>📥 Payments log (webhook)</h2>
+    <div id="paymentList"></div>
+  </div>
+  <div class="card">
+    <h2>🔗 Webhook URL (auto activation ke liye)</h2>
+    <pre id="webhookInfo"></pre>
+  </div>
+</div>
+
 <!-- SETTINGS -->
 <div id="tab-settings" class="hidden">
   <div class="card">
@@ -4129,9 +4998,24 @@ a{color:#79c0ff}
       <div><label>Brand tag (har response me "Powered by ...")</label><input id="stBrand" placeholder="@Supermannn_x"></div>
     </div>
     <div class="row">
-      <div><label>HaveIBeenPwned API key (optional, email breaches ke liye)</label><input id="stHibp" placeholder=""></div>
+      <div><label>HaveIBeenPwned API key (optional)</label><input id="stHibp" placeholder=""></div>
       <div><label>New admin password</label><input id="stAdmin" placeholder="change karne ke liye likho"></div>
     </div>
+    <h2 style="margin-top:18px">💸 Store / Payment settings</h2>
+    <div class="row">
+      <div><label>UPI ID (payment yahan aayega)</label><input id="stUpi" placeholder="aapka@okhdfcbank"></div>
+      <div><label>UPI display name</label><input id="stUpiName" placeholder="OSINT API Hub"></div>
+    </div>
+    <div class="row">
+      <div><label>Telegram support (@username)</label><input id="stSupport" placeholder="@Supermannn_x"></div>
+      <div><label>Webhook secret (optional, security)</label><input id="stWsec" placeholder=""></div>
+    </div>
+    <div class="row">
+      <div><label>Website title</label><input id="stTitle" placeholder="OSINT API Hub"></div>
+      <div><label>Website tagline</label><input id="stTagline" placeholder="59 Powerful APIs..."></div>
+    </div>
+    <div class="row"><div><label>Plans JSON (advanced - khali chhod do to default plans)</label>
+      <textarea id="stPlans" placeholder='[{"id":"num","name":"Number Pack","days":30,"endpoints":"num-info,family","price":100,"description":"30 din"}]'></textarea></div></div>
     <button class="action" onclick="saveSettings()">Save Settings</button>
     <button class="ghost" onclick="clearCache()">🧹 Clear Cache</button>
   </div>
@@ -4174,7 +5058,7 @@ document.querySelectorAll('nav button').forEach(b=>{
   b.onclick = ()=>{
     document.querySelectorAll('nav button').forEach(x=>x.classList.remove('active'));
     b.classList.add('active');
-    ['endpoints','database','keys','logs','settings','help'].forEach(t=>{
+    ['endpoints','database','keys','resellers','payments','logs','settings','help'].forEach(t=>{
       document.getElementById('tab-'+t).classList.add('hidden');
     });
     document.getElementById('tab-'+b.dataset.tab).classList.remove('hidden');
@@ -4182,6 +5066,8 @@ document.querySelectorAll('nav button').forEach(b=>{
     if(b.dataset.tab==='keys') loadKeys();
     if(b.dataset.tab==='logs'){ loadLogs(); loadOverview(); }
     if(b.dataset.tab==='settings') loadSettings();
+    if(b.dataset.tab==='resellers') loadResellers();
+    if(b.dataset.tab==='payments') loadOrders();
   };
 });
 
@@ -4431,6 +5317,126 @@ async function toggleKey(id){ await fetch('/admin/keys/'+id+'/toggle',{method:'P
 async function delKey(id){ if(!confirm('Delete key?')) return;
   await fetch('/admin/keys/'+id,{method:'DELETE',headers:adminHeaders()}); loadKeys(); }
 
+/* ---------- resellers ---------- */
+let RTOKEN = localStorage.getItem('osint_reseller') || '';
+async function rsFetch(url, opts){
+  const h = {'Content-Type':'application/json'};
+  if(RTOKEN) h['X-Reseller-Token']=RTOKEN;
+  const r = await fetch(url, Object.assign({headers:h}, opts||{}));
+  if(r.status===401){ toast('Reseller login karo', true); throw new Error('unauthorized'); }
+  return r.json();
+}
+async function loadResellers(){
+  try{
+    const j = await adminFetch('/admin/resellers');
+    if(!j.success) return;
+    document.getElementById('rsList').innerHTML = j.resellers.length ?
+      '<table><tr><th>ID</th><th>Username</th><th>Naam</th><th>Credit</th><th>Keys</th><th>Max days</th><th>Endpoints</th><th>Status</th><th>Actions</th></tr>'+
+      j.resellers.map(r=>'<tr><td>'+r.id+'</td><td><b>'+r.username+'</b></td><td>'+(r.name||'')+'</td>'+
+      '<td class="'+(r.credit>0?'ok':'bad')+'">'+r.credit+'</td><td>'+r.keys_created+'</td>'+
+      '<td>'+r.max_days+'</td><td class="src">'+r.allowed_endpoints+'</td>'+
+      '<td>'+(r.is_active?'<span class="ok">Active</span>':'<span class="bad">Disabled</span>')+'</td>'+
+      '<td><button class="ghost small" onclick="addCredit('+r.id+',10)">+10</button>'+
+      '<button class="ghost small" onclick="addCredit('+r.id+',50)">+50</button>'+
+      '<button class="ghost small" onclick="toggleReseller('+r.id+')">'+(r.is_active?'Disable':'Enable')+'</button>'+
+      '<button class="danger small" onclick="delReseller('+r.id+')">🗑</button></td></tr>').join('')+'</table>'
+      : '<p style="color:var(--muted)">Koi reseller nahi.</p>';
+  }catch(e){}
+}
+async function createReseller(){
+  const payload = {username: document.getElementById('rsUser').value,
+    password: document.getElementById('rsPass').value,
+    name: document.getElementById('rsName').value,
+    telegram: document.getElementById('rsTg').value,
+    credit: parseInt(document.getElementById('rsCredit').value||'10'),
+    max_days: parseInt(document.getElementById('rsMaxDays').value||'30'),
+    allowed_endpoints: document.getElementById('rsEndpoints').value||'*'};
+  const r = await fetch('/admin/resellers',{method:'POST',headers:adminHeaders(),body:JSON.stringify(payload)});
+  const j = await r.json();
+  if(j.success){ toast('Reseller ban gaya ✅'); loadResellers();
+    alert('RESELLER LOGIN\nUsername: '+j.username+'\nPassword: '+j.password+'\nCredit: '+j.credit); }
+  else toast(j.error||'Error', true);
+}
+async function addCredit(id, amount){
+  const r = await fetch('/admin/resellers/'+id+'/credit',{method:'POST',headers:adminHeaders(),
+    body:JSON.stringify({amount:amount})});
+  const j = await r.json(); toast('Credit: '+j.credit+' ✅'); loadResellers();
+}
+async function toggleReseller(id){
+  await fetch('/admin/resellers/'+id+'/toggle',{method:'POST',headers:adminHeaders()}); loadResellers();
+}
+async function delReseller(id){
+  if(!confirm('Delete reseller?')) return;
+  await fetch('/admin/resellers/'+id,{method:'DELETE',headers:adminHeaders()}); loadResellers();
+}
+async function resellerLogin(){
+  const r = await fetch('/reseller/login',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({username:document.getElementById('rsLoginUser').value,
+                         password:document.getElementById('rsLoginPass').value})});
+  const j = await r.json();
+  if(j.success){ RTOKEN = j.token; localStorage.setItem('osint_reseller', j.token);
+    toast('Reseller login ✅'); loadResellerKeys(); }
+  else toast(j.error||'Login failed', true);
+}
+async function loadResellerKeys(){
+  try{
+    const j = await rsFetch('/reseller/me');
+    if(!j.success) return;
+    document.getElementById('rsPanel').innerHTML =
+      '<div class="stat"><b>'+j.reseller.credit+'</b><span>Credit left</span></div>'+
+      '<pre>'+JSON.stringify(j.reseller,null,1)+'</pre>'+
+      '<h3>Mere keys ('+j.keys.length+')</h3>'+
+      '<table><tr><th>Key</th><th>Customer</th><th>Plan</th><th>Expiry</th><th>Use</th></tr>'+
+      j.keys.map(k=>'<tr><td><code>'+k.api_key.slice(0,14)+'...</code></td><td>'+(k.customer||'')+'</td>'+
+        '<td class="src">'+k.allowed_endpoints+'</td><td>'+(k.expires_at||'Lifetime')+'</td>'+
+        '<td>'+k.requests+'</td></tr>').join('')+'</table>';
+  }catch(e){}
+}
+
+/* ---------- payments / orders ---------- */
+async function loadOrders(){
+  try{
+    const j = await adminFetch('/admin/orders');
+    if(!j.success) return;
+    const paid = j.orders.filter(o=>o.status==='paid');
+    const pend = j.orders.filter(o=>o.status==='pending');
+    const total = paid.reduce((a,o)=>a+(o.amount||0),0);
+    document.getElementById('paySummary').innerHTML =
+      '<div class="stats"><div class="stat"><b>'+paid.length+'</b><span>Paid orders</span></div>'+
+      '<div class="stat"><b>₹'+total+'</b><span>Revenue</span></div>'+
+      '<div class="stat"><b>'+pend.length+'</b><span>Pending</span></div>'+
+      '<div class="stat"><b>'+j.payments.length+'</b><span>Webhook hits</span></div></div>';
+    document.getElementById('orderList').innerHTML = j.orders.length ?
+      '<table><tr><th>Code</th><th>Customer</th><th>Plan</th><th>Amount</th><th>Status</th><th>Time</th><th>Action</th></tr>'+
+      j.orders.map(o=>'<tr><td><span class="code">'+o.order_code+'</span></td><td>'+(o.customer_name||'')+
+      '<br><span class="src">'+(o.phone||'')+'</span></td><td>'+o.plan_name+' ('+o.days+'d)</td>'+
+      '<td>₹'+o.amount+'</td><td class="'+(o.status==='paid'?'ok':'warn')+'">'+o.status+'</td>'+
+      '<td class="src">'+(o.created_at||'')+'</td>'+
+      '<td>'+(o.status==='paid'?'✅':'<button class="ghost small" onclick="markPaid('+o.id+')">Mark Paid</button>')+
+      '</td></tr>').join('')+'</table>' : '<p style="color:var(--muted)">Koi order nahi.</p>';
+    document.getElementById('paymentList').innerHTML = j.payments.length ?
+      '<table><tr><th>ID</th><th>Amount</th><th>UTR</th><th>Payer</th><th>Match</th><th>Time</th></tr>'+
+      j.payments.map(p=>'<tr><td>'+p.id+'</td><td>₹'+p.amount+'</td><td>'+(p.utr||'')+'</td>'+
+      '<td>'+(p.payer||'')+'</td><td class="'+(p.status==='matched'?'ok':'bad')+'">'+p.status+'</td>'+
+      '<td class="src">'+(p.received_at||'')+'</td></tr>').join('')+'</table>' :
+      '<p style="color:var(--muted)">Abhi koi webhook payment nahi aaya.</p>';
+    document.getElementById('webhookInfo').textContent =
+      'POST '+location.origin+'/webhook/payment\n'+
+      'Headers: Content-Type: application/json, X-Webhook-Secret: <settings wala secret>\n'+
+      'Body: {"utr":"123456789012","amount":100,"remark":"OSXXXXXXXX","payer":"NAME"}\n\n'+
+      'Ya SMS forwarder ke liye:\n'+
+      'POST '+location.origin+'/webhook/upi-sms\n'+
+      'Body: {"sms":"Rs.100 credited to your account ... UPI Ref No 123456789012"}';
+  }catch(e){}
+}
+async function markPaid(id){
+  const r = await fetch('/admin/orders/'+id+'/mark-paid',{method:'POST',headers:adminHeaders(),
+    body:JSON.stringify({utr:'MANUAL'})});
+  const j = await r.json();
+  if(j.success){ toast('Key activate ho gayi ✅'); alert('API KEY: '+j.api_key); loadOrders(); }
+  else toast(j.error||'Error', true);
+}
+
 /* ---------- logs ---------- */
 async function loadLogs(){
   try{
@@ -4465,6 +5471,13 @@ async function loadSettings(){
     document.getElementById('stMaxSec').value=s.max_request_seconds||'50';
     document.getElementById('stBrand').value=s.brand_tag||'@Supermannn_x';
     document.getElementById('stHibp').value=s.hibp_api_key||'';
+    document.getElementById('stUpi').value=s.upi_id||'';
+    document.getElementById('stUpiName').value=s.upi_name||'';
+    document.getElementById('stSupport').value=s.telegram_support||'';
+    document.getElementById('stWsec').value=s.webhook_secret||'';
+    document.getElementById('stTitle').value=s.store_title||'';
+    document.getElementById('stTagline').value=s.store_tagline||'';
+    document.getElementById('stPlans').value=s.store_plans||'';
     document.getElementById('brandBar').textContent='API Developer: '+(s.brand_tag||'@Supermannn_x')+' (Telegram)';
     document.getElementById('brandFoot').textContent=(s.brand_tag||'@Supermannn_x');
     document.getElementById('brandFoot2').textContent=(s.brand_tag||'@Supermannn_x');
@@ -4482,7 +5495,14 @@ async function saveSettings(){
     github_token: document.getElementById('stGithub').value,
     max_request_seconds: document.getElementById('stMaxSec').value,
     brand_tag: document.getElementById('stBrand').value,
-    hibp_api_key: document.getElementById('stHibp').value
+    hibp_api_key: document.getElementById('stHibp').value,
+    upi_id: document.getElementById('stUpi').value,
+    upi_name: document.getElementById('stUpiName').value,
+    telegram_support: document.getElementById('stSupport').value,
+    webhook_secret: document.getElementById('stWsec').value,
+    store_title: document.getElementById('stTitle').value,
+    store_tagline: document.getElementById('stTagline').value,
+    store_plans: document.getElementById('stPlans').value
   };
   const admin = document.getElementById('stAdmin').value;
   if(admin){ settings.admin_password = admin; TOKEN = admin; localStorage.setItem('osint_admin', admin);
