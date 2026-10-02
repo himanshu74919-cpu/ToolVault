@@ -2318,6 +2318,10 @@ async def native_aadhaar_family(params: Dict[str, Any], request: Request) -> Tup
 # ---------------------------------------------------------------------
 # YOUTUBE DOWNLOADER (for Telegram bots)
 # ---------------------------------------------------------------------
+# Cloud/datacenter IP (Render free) par YouTube yt-dlp ko block kar deta hai.
+# Ek baar fail hone ke baad 10 minute tak yt-dlp skip karke seedha fallback try karenge.
+_YT_STATE = {"ytdlp_fail_until": 0.0}
+
 # Public YouTube front-end APIs — datacenter IP (Render) par yt-dlp block ho jata hai,
 # tab ye fallback direct streaming links de dete hain.
 PIPED_INSTANCES = [
@@ -2558,24 +2562,34 @@ async def native_youtube_download(params: Dict[str, Any], request: Request) -> T
     deadline = float(get_setting("max_request_seconds", "50") or 50)
     # Render free plan ~25-30s me request maar deta hai, isliye fallback chain tight rakhi hai
     hard_deadline = min(deadline, 26.0)
-    try:
-        loop = __import__("asyncio").get_event_loop()
-        result = await loop.run_in_executor(
-            None, lambda: _yt_extract(watch, "audio" if mode == "audio" else mode, quality,
-                                      timeout=int(max(12, min(hard_deadline * 0.7, 18)))))
-    except Exception as exc:
-        error = str(exc)[:200]
+    loop = __import__("asyncio").get_event_loop()
+    ytdlp_skipped = time.time() < _YT_STATE["ytdlp_fail_until"]
+    if not ytdlp_skipped:
+        try:
+            result = await loop.run_in_executor(
+                None, lambda: _yt_extract(watch, "audio" if mode == "audio" else mode, quality,
+                                          timeout=int(max(8, min(hard_deadline * 0.45, 14)))))
+        except Exception as exc:
+            error = str(exc)[:200]
+    else:
+        result = {}
+
+    ytdlp_err = (result.get("error") if isinstance(result, dict) else None) or error or None
+    if ytdlp_err and not (result.get("links") if isinstance(result, dict) else None):
+        _YT_STATE["ytdlp_fail_until"] = time.time() + 600
 
     debug["yt_dlp"] = {
         "links": len(result.get("links") or []) if isinstance(result, dict) else 0,
-        "error": (result.get("error") if isinstance(result, dict) else None) or error or None,
+        "error": ytdlp_err,
+        "skipped_recent_failure": ytdlp_skipped,
     }
 
     # fallback 1: Piped API (datacenter IP par bhi kaam karta hai)
     links = result.get("links") if isinstance(result, dict) else None
     upstream_links: List[Dict[str, Any]] = []
     sources: List[str] = []
-    if not links and (time.time() - started) < hard_deadline * 0.75:
+    if not (result.get("links") if isinstance(result, dict) else None) \
+            and (time.time() - started) < hard_deadline * 0.85:
         left = hard_deadline - (time.time() - started)
         try:
             piped = await loop.run_in_executor(
@@ -2591,7 +2605,7 @@ async def native_youtube_download(params: Dict[str, Any], request: Request) -> T
 
     # fallback 2: Invidious API
     if not (result.get("links") if isinstance(result, dict) else None) \
-            and (time.time() - started) < hard_deadline * 0.85:
+            and (time.time() - started) < hard_deadline * 0.92:
         left = hard_deadline - (time.time() - started)
         try:
             inv = await loop.run_in_executor(
