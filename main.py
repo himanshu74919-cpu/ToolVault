@@ -41,7 +41,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 # =====================================================================
 # CONFIGURATION  (everything can be changed from the dashboard too)
 # =====================================================================
-APP_VERSION = "2.2.1"
+APP_VERSION = "2.3.0"
 DB_PATH = os.environ.get("DB_PATH", "osint_database.db")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -2731,6 +2731,95 @@ def _invidious_streams(vid: str, mode: str, quality: str = "", tries: int = 3,
     return {"links": [], "tried": tried, "errors": errors}
 
 
+# ---------------------------------------------------------------------
+# v2.3 — PUBLIC DOWNLOADER PROVIDERS (Render IP block ka permanent ilaaj)
+# Ye services apne server par YouTube extract karti hain aur CDN link deti hain,
+# isliye link kisi bhi IP se chalta hai (googlevideo links IP-locked hote hain).
+# ---------------------------------------------------------------------
+PUBLIC_YT_PROVIDERS = (
+    "https://apis.davidcyriltech.my.id",      # savetube CDN — video + mp3
+)
+
+
+async def _provider_savetube(vid: str, watch: str, mode: str, budget: float) -> Dict[str, Any]:
+    import httpx
+    out: Dict[str, Any] = {"links": [], "tried": ["savetube"], "errors": [], "title": ""}
+    paths = [("/download/ytmp4", "video"), ("/download/ytmp3", "audio")]
+    if mode == "audio":
+        paths = [("/download/ytmp3", "audio")]
+    elif mode == "both":
+        paths = [("/download/ytmp4", "video"), ("/download/ytmp3", "audio")]
+    try:
+        async with httpx.AsyncClient(timeout=max(8.0, min(25.0, budget)), follow_redirects=True,
+                                     headers={"User-Agent": UA}) as client:
+            for path, kind in paths:
+                try:
+                    r = await client.get(PUBLIC_YT_PROVIDERS[0] + path, params={"url": watch})
+                    if r.status_code != 200:
+                        out["errors"].append(f"{path}: HTTP {r.status_code}")
+                        continue
+                    data = r.json()
+                    res = data.get("result") or {}
+                    url = str(res.get("download_url") or res.get("url") or "")
+                    if not url.startswith("http"):
+                        out["errors"].append(f"{path}: no url")
+                        continue
+                    if res.get("title") and not out["title"]:
+                        out["title"] = str(res["title"])
+                    out["links"].append({
+                        "type": kind,
+                        "provider": "savetube",
+                        "quality": str(res.get("quality") or ("audio" if kind == "audio" else "video")),
+                        "ext": str(res.get("format") or ("mp3" if kind == "audio" else "mp4")),
+                        "url": url,
+                    })
+                except Exception as exc:  # noqa: BLE001
+                    out["errors"].append(f"{path}: {str(exc)[:80]}")
+    except Exception as exc:  # noqa: BLE001
+        out["errors"].append(str(exc)[:100])
+    return out
+
+
+async def _provider_loaderto(vid: str, watch: str, mode: str, budget: float) -> Dict[str, Any]:
+    """loader.to — format do, phir progress poll karo (link unke CDN par hota hai)."""
+    import asyncio as _aio
+    import httpx
+    out: Dict[str, Any] = {"links": [], "tried": ["loader.to"], "errors": [], "title": ""}
+    fmt = "mp3" if mode == "audio" else "360"
+    try:
+        async with httpx.AsyncClient(timeout=max(8.0, min(25.0, budget)), follow_redirects=True,
+                                     headers={"User-Agent": UA}) as client:
+            r = await client.get("https://loader.to/ajax/download.php",
+                                 params={"format": fmt, "url": watch})
+            if r.status_code != 200:
+                out["errors"].append(f"start HTTP {r.status_code}")
+                return out
+            start = r.json()
+            pid = start.get("id")
+            out["title"] = str(start.get("title") or "")
+            if not pid:
+                out["errors"].append("no id")
+                return out
+            polls = int(max(3, min(10, budget / 3)))
+            for _ in range(polls):
+                await _aio.sleep(3)
+                p = await client.get("https://loader.to/ajax/progress.php", params={"id": pid})
+                if p.status_code != 200:
+                    continue
+                pj = p.json()
+                url = str(pj.get("download_url") or "")
+                if url.startswith("http"):
+                    out["links"].append({
+                        "type": "video" if fmt != "mp3" else "audio",
+                        "provider": "loader.to", "quality": fmt + "p" if fmt != "mp3" else "audio",
+                        "ext": "mp3" if fmt == "mp3" else "mp4", "url": url,
+                    })
+                    break
+    except Exception as exc:  # noqa: BLE001
+        out["errors"].append(str(exc)[:100])
+    return out
+
+
 # 🐛 v2.2 FIX: ye dict pehle code me USE hoti thi par DEFINE kabhi nahi hui thi
 # (_YT_STATE["ytdlp_fail_until"] → NameError → /youtube-download 502). Ab define hai.
 _YT_STATE: Dict[str, float] = {"ytdlp_fail_until": 0.0}
@@ -2886,6 +2975,28 @@ async def native_youtube_download(params: Dict[str, Any], request: Request) -> T
                 sources.append("yt-dlp")
             elif ytdlp_err:
                 _YT_STATE["ytdlp_fail_until"] = time.time() + 300
+    # 🆕 v2.3 — 1.5) PUBLIC PROVIDERS: Render jaise blocked IP se bhi kaam karte hain
+    if not result_holder.get("links"):
+        _left = hard_deadline - (time.time() - started)
+        if _left > 8:
+            for _pf in (_provider_savetube, _provider_loaderto):
+                _left = hard_deadline - (time.time() - started)
+                if _left < 6:
+                    break
+                try:
+                    _pout = await loop.run_in_executor(
+                        None, lambda: __import__("asyncio").run(_pf(vid, watch, mode, _left)))
+                except Exception as _pexc:  # noqa: BLE001
+                    debug[_pf.__name__] = {"error": str(_pexc)[:120]}
+                    continue
+                debug[_pf.__name__] = {"links": len(_pout.get("links") or []),
+                                       "errors": (_pout.get("errors") or [])[:2]}
+                if _pout.get("links"):
+                    result_holder.update({"video_id": vid, "title": _pout.get("title") or "",
+                                          "links": _pout["links"],
+                                          "thumbnail": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"})
+                    sources.append(_pout["tried"][0])
+                    break
     # 2) Invidious (proxied links)
     if not result_holder.get("links") and (hard_deadline - (time.time() - started)) > 8:
         await _try(_invidious_streams, "invidious",
@@ -2959,7 +3070,12 @@ async def native_youtube_download(params: Dict[str, Any], request: Request) -> T
     try:
         _base = str(request.base_url).rstrip("/")
         for l in all_links:
-            if l.get("url"):
+            if not l.get("url"):
+                continue
+            _h = urllib.parse.urlparse(str(l["url"])).hostname or ""
+            # CDN links (savetube/savenow) IP-free hote hain — unhe proxy ki zaroorat nahi;
+            # googlevideo links IP-locked hote hain — unke liye proxy_url banao.
+            if any(_h == h or _h.endswith("." + h) for h in YDL_ALLOWED_HOSTS):
                 l["proxy_url"] = (f"{_base}/api/ydl/stream?key={DEMO_KEY}"
                                   f"&url={urllib.parse.quote(str(l['url']), safe='')}")
     except Exception:
