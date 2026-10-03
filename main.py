@@ -29,6 +29,7 @@ import sqlite3
 import time
 import urllib.parse
 import asyncio
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
@@ -113,11 +114,20 @@ app.add_middleware(HeadSupportMiddleware)
 # =====================================================================
 # DATABASE (SQLite)
 # =====================================================================
+@contextmanager
 def db():
+    """SQLite connection scope: commit on success, rollback on error, always close."""
     conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def init_db():
@@ -187,7 +197,7 @@ def init_db():
         "upi_name": os.environ.get("UPI_NAME", "OSINT API Hub"),
         "telegram_support": DEFAULT_BRAND,
         "store_title": "OSINT API Hub",
-        "store_tagline": "59 Powerful APIs — Number · Vehicle · Aadhaar · YouTube · Email",
+        "store_tagline": "Utility APIs — TAC-only device hints · IP · IFSC · Pincode · YouTube; restricted personal lookups disabled",
         "store_plans": "",
         "webhook_secret": os.environ.get("WEBHOOK_SECRET", ""),
         "admin_password": ADMIN_PASSWORD,
@@ -928,23 +938,24 @@ async def native_ip_v3(params: Dict[str, Any], request: Request) -> Tuple[Option
 
 
 async def native_imei(params: Dict[str, Any], request: Request) -> Tuple[Optional[Dict], bool]:
-    imei = clean_number(params.get("imei") or params.get("q") or "")
-    if len(imei) not in (14, 15, 16):
-        return {"imei": imei, "valid": False,
-                "error": "IMEI must be 14-16 digits (15 is standard)"}, True
-    tac, snr = imei[:8], imei[8:14]
-    cd = imei[14] if len(imei) >= 15 else ""
-    brand, model = TAC_HINTS.get(tac[:6], TAC_HINTS.get(tac[:4], (None, None)))
-    body = REPORTING_BODIES.get(imei[:2], "Unknown / not in local table")
-    known = bool(brand)
+    """TAC-only lookup: device serial/check digit are never needed or returned."""
+    raw = clean_number(params.get("tac") or params.get("imei") or params.get("q") or "")
+    if len(raw) < 8:
+        return {"success": False, "tac": raw,
+                "error": "8-digit TAC chahiye (IMEI ke pehle 8 digits)."}, True
+    tac = raw[:8]
+    brand, model = TAC_HINTS.get(tac, TAC_HINTS.get(tac[:6], TAC_HINTS.get(tac[:4], (None, None))))
+    body = REPORTING_BODIES.get(tac[:2], "Unknown / not in local table")
+    known = bool(brand or model)
     result = {
-        "imei": imei, "imei2": None, "valid_length": True,
-        "luhn_check": "passed" if luhn_ok(imei) else "failed",
-        "is_valid_as_per_luhn": luhn_ok(imei),
-        "tac": tac, "reporting_body": body, "serial_number": snr, "check_digit": cd,
-        "brand": brand, "model": model,
-        "note": ("Local heuristic lookup - enable upstream for full GSMA / imei.info data"
-                 if not known else "Matched local TAC table"),
+        "success": known,
+        "tac": tac,
+        "brand": brand,
+        "model": model,
+        "reporting_body": body,
+        "device_match": known,
+        "note": ("TAC local catalog me nahi mila; full device-spec catalog configured nahi hai."
+                 if not known else "Local TAC match. Sirf pehle 8 digits use hue; serial/check digit discard kiye gaye."),
         "requested_at": datetime.now(IST).isoformat(),
     }
     return result, not known
@@ -1113,7 +1124,7 @@ def parse_vehicle(number: str) -> Dict[str, Any]:
     info: Dict[str, Any] = {"registrationNo": clean or raw, "input": raw}
     if not m:
         info["format_valid"] = False
-        info["error"] = "Could not parse registration number (expected e.g. HR26EV0001 / MH12DE1433)"
+        info["error"] = "Could not parse registration number; check the plate format (state code + RTO code + series + number)."
         return info
     state, dist, series, num = m.groups()
     rto_code = f"{state}{int(dist):02d}"
@@ -2252,7 +2263,7 @@ async def native_aadhaar_family(params: Dict[str, Any], request: Request) -> Tup
                 "formatted": ("╔══════════════════════════════════════╗\n"
                               "║       📜 AADHAAR FAMILY INTEL        ║\n"
                               "╚══════════════════════════════════════╝\n\n"
-                              "❌ 12 digit ka Aadhaar number daalo. Example: /api/aadhaar-family?key=Demo&aadhaar=861313813129"),
+                              "❌ 12 digit ka Aadhaar number daalo. Example: /api/aadhaar-family?key=Demo&aadhaar=000000000000"),
                 "_no_cache": True}, True
 
     deadline = float(get_setting("max_request_seconds", "50") or 50)
@@ -3120,8 +3131,8 @@ ENDPOINTS: List[Dict[str, Any]] = [
 
     # ---------- Device ----------
     dict(path="imei", name="IMEI Info", icon="📱", category="Device", native="imei",
-         mode="merge_upstream", params=[P("imei", "353010111111110")],
-         desc="IMEI validation (Luhn), TAC / reporting body decode, brand hint + upstream device data."),
+         mode="native", params=[P("imei", "35301011")],
+         desc="Device model hint by TAC (first 8 IMEI digits only). Full serial digits are discarded; no blacklist or owner lookup."),
 
     # ---------- World ----------
     dict(path="country", name="Country Info", icon="🗺️", category="World", native="country",
@@ -3145,30 +3156,30 @@ ENDPOINTS: List[Dict[str, Any]] = [
          desc="Post office list, district and state for any Indian PIN code."),
 
     # ---------- Vehicle ----------
-    dict(path="vehicle-challan", name="Vehicle Challan", icon="🚗", category="Vehicle",
-         native="vehicle_challan", mode="merge_native", params=[P("number", "HR26EV0001")],
-         desc="Vehicle challan lookup (upstream) + offline RTO parsing."),
-    dict(path="vehicle-challan-v2", name="Vehicle Challan V2", icon="🚗", category="Vehicle",
-         native="vehicle_challan_v2", mode="merge_native", params=[P("number", "HR26EV0001")],
-         desc="Vehicle challan lookup version 2."),
-    dict(path="vehicle-challan-v4", name="Vehicle Challan V4", icon="🚗", category="Vehicle",
-         native="vehicle_challan_v4", mode="merge_native", params=[P("number", "HR26EV0001")],
-         desc="Vehicle challan lookup version 4."),
-    dict(path="vehicle-info", name="Vehicle Info", icon="🚙", category="Vehicle",
-         native="vehicle_info", mode="merge_native", params=[P("vehicle_number", "HR26EV0001")],
-         desc="Registration number decode: state, RTO district, series + upstream details."),
-    dict(path="vehicle-info-v2", name="Vehicle Info V2", icon="🚙", category="Vehicle",
-         native="vehicle_info_v2", mode="merge_native", params=[P("vehicle_number", "HR26EV0001")],
-         desc="Vehicle information version 2."),
-    dict(path="vehicle-rc", name="Vehicle RC", icon="📄", category="Vehicle",
-         native="vehicle_rc", mode="merge_native", params=[P("number", "HR26EV0001")],
-         desc="RC / registration details (upstream) with offline RTO decoding."),
-    dict(path="vehicle-details", name="Vehicle Details", icon="🧾", category="Vehicle",
-         native="vehicle_details", mode="merge_native", params=[P("number", "MH12DE1433")],
-         desc="Full vehicle details (owner, insurance, PUCC if upstream provides)."),
-    dict(path="vehicle-v", name="Vehicle V", icon="🚘", category="Vehicle",
-         native="vehicle_v", mode="merge_native", params=[P("rc", "MH12DE1433")],
-         desc="Vehicle verification by RC number."),
+    dict(path="vehicle-challan", name="Vehicle Challan (disabled)", icon="🔒", category="Vehicle",
+         native="vehicle_challan", mode="merge_native", params=[P("number", "XX00XX0000")],
+         desc="Disabled until an authorized vehicle/challan provider is configured; use official e-Challan portal."),
+    dict(path="vehicle-challan-v2", name="Vehicle Challan V2 (disabled)", icon="🔒", category="Vehicle",
+         native="vehicle_challan_v2", mode="merge_native", params=[P("number", "XX00XX0000")],
+         desc="Disabled for privacy/authorization; use official e-Challan portal."),
+    dict(path="vehicle-challan-v4", name="Vehicle Challan V4 (disabled)", icon="🔒", category="Vehicle",
+         native="vehicle_challan_v4", mode="merge_native", params=[P("number", "XX00XX0000")],
+         desc="Disabled for privacy/authorization; use official e-Challan portal."),
+    dict(path="vehicle-info", name="Vehicle Info (disabled)", icon="🔒", category="Vehicle",
+         native="vehicle_info", mode="merge_native", params=[P("vehicle_number", "XX00XX0000")],
+         desc="Live vehicle-owner lookup is disabled; only public RTO parsing/official links are available in the bot."),
+    dict(path="vehicle-info-v2", name="Vehicle Info V2 (disabled)", icon="🔒", category="Vehicle",
+         native="vehicle_info_v2", mode="merge_native", params=[P("vehicle_number", "XX00XX0000")],
+         desc="Disabled for privacy/authorization."),
+    dict(path="vehicle-rc", name="Vehicle RC (disabled)", icon="🔒", category="Vehicle",
+         native="vehicle_rc", mode="merge_native", params=[P("number", "XX00XX0000")],
+         desc="Disabled until an authorized provider is configured; use official VAHAN portal."),
+    dict(path="vehicle-details", name="Vehicle Details (disabled)", icon="🔒", category="Vehicle",
+         native="vehicle_details", mode="merge_native", params=[P("number", "XX00XX0000")],
+         desc="Disabled for privacy/authorization; do not query owner records from an arbitrary plate."),
+    dict(path="vehicle-v", name="Vehicle V (disabled)", icon="🔒", category="Vehicle",
+         native="vehicle_v", mode="merge_native", params=[P("rc", "XX00XX0000")],
+         desc="Disabled for privacy/authorization."),
 
     # ---------- Media ----------
     dict(path="song", name="Song Downloader", icon="🎵", category="Media", native="song",
@@ -3226,26 +3237,24 @@ ENDPOINTS: List[Dict[str, Any]] = [
          desc="Video information from a YouTube video id."),
 
     # ---------- Leak OSINT ----------
-    dict(path="leak-v1", name="Leak OSINT V1", icon="🔥", category="Leak OSINT", native="leak",
-         mode="upstream", params=[P("q", "919973700987")], db_category="leak", cache_ttl=43200,
-         desc="Search leaked / breach databases by phone, email or name."),
-    dict(path="leak-v2", name="Leak OSINT V2", icon="🔥", category="Leak OSINT", native="leak",
-         mode="upstream", params=[P("q", "919973700987")], db_category="leak", cache_ttl=43200,
-         desc="Leak OSINT search, version 2."),
-    dict(path="num-info", name="Number Info (Full Report)", icon="📞", category="Leak OSINT",
-         native="num_info_full", mode="native", timeout=70, cache_ttl=43200,
-         params=[P("q", "919973700984")],
-         desc="⭐ Own number API: name, father, all phone/alt numbers, region, govt ID, addresses "
-              "(own DB + num-info + leak-v1/v2, merged). Add &format=text for the card message, "
-              "&deep=1 to try more number variants, &raw=1 for raw upstream payloads."),
-    dict(path="number-info", name="Number Info (alias)", icon="📞", category="Leak OSINT",
-         native="num_info_full", mode="native", timeout=70, cache_ttl=43200,
-         params=[P("q", "9058390341")],
-         desc="Same as /api/num-info (alias for older bots)."),
-    dict(path="num", name="Number (short alias)", icon="☎️", category="Leak OSINT",
-         native="num_info_full", mode="native", timeout=70, cache_ttl=43200,
-         params=[P("q", "9058390341")],
-         desc="Short alias of /api/num-info."),
+    dict(path="leak-v1", name="Leak OSINT V1 (disabled)", icon="🔒", category="Privacy", native="leak",
+         mode="upstream", params=[P("q", "")], db_category="leak", cache_ttl=0,
+         desc="Disabled for privacy; no leaked personal records are searched or returned."),
+    dict(path="leak-v2", name="Leak OSINT V2 (disabled)", icon="🔒", category="Privacy", native="leak",
+         mode="upstream", params=[P("q", "")], db_category="leak", cache_ttl=0,
+         desc="Disabled for privacy; no leaked personal records are searched or returned."),
+    dict(path="num-info", name="Number Info (disabled in hub)", icon="🔒", category="Privacy",
+         native="num_info_full", mode="native", timeout=1, cache_ttl=0,
+         params=[P("q", "")],
+         desc="Hub lookup disabled for privacy. Telegram bot me sirf local non-sensitive phone metadata aur official safety links milte hain."),
+    dict(path="number-info", name="Number Info (disabled alias)", icon="🔒", category="Privacy",
+         native="num_info_full", mode="native", timeout=1, cache_ttl=0,
+         params=[P("q", "")],
+         desc="Disabled for privacy; no name, family, linked number, address or government ID is returned."),
+    dict(path="num", name="Number (disabled alias)", icon="🔒", category="Privacy",
+         native="num_info_full", mode="native", timeout=1, cache_ttl=0,
+         params=[P("q", "")],
+         desc="Disabled for privacy; no leaked personal records are searched or returned."),
 
     # ---------- GST / PAN ----------
     dict(path="gst-search", name="GST Search", icon="🧮", category="GST / PAN", native="gst_search",
@@ -3277,59 +3286,55 @@ ENDPOINTS: List[Dict[str, Any]] = [
          desc="PAN validation, holder type and linked details."),
 
     # ---------- Own report APIs (aggregated) ----------
-    dict(path="vehicle-report", name="Vehicle Report (RC + Challan)", icon="🚘", category="Vehicle",
-         native="vehicle_report", mode="native", timeout=90, cache_ttl=21600,
-         params=[P("number", "BR30AR0802")],
-         desc="⭐ Own vehicle API by number plate: maker/model, class, fuel, owner, RTO, RC dates, "
-              "insurance, PUC and full challan list. Add &format=text for the ready-to-share card."),
-    dict(path="vehicle-full", name="Vehicle Report (alias)", icon="🚘", category="Vehicle",
-         native="vehicle_report", mode="native", timeout=90, cache_ttl=21600,
-         params=[P("number", "MH12DE1433")],
-         desc="Alias of /api/vehicle-report."),
-    dict(path="rc-info", name="RC Info (alias)", icon="📄", category="Vehicle",
-         native="vehicle_report", mode="native", timeout=90, cache_ttl=21600,
-         params=[P("rc", "BR30AR0802")],
-         desc="RC details by registration number (alias of /api/vehicle-report)."),
+    dict(path="vehicle-report", name="Vehicle Report (disabled)", icon="🔒", category="Vehicle",
+         native="vehicle_report", mode="native", timeout=1, cache_ttl=0,
+         params=[P("number", "XX00XX0000")],
+         desc="Disabled until an authorized provider is configured. Official VAHAN/e-Challan links are available."),
+    dict(path="vehicle-full", name="Vehicle Report (disabled alias)", icon="🔒", category="Vehicle",
+         native="vehicle_report", mode="native", timeout=1, cache_ttl=0,
+         params=[P("number", "XX00XX0000")],
+         desc="Disabled for privacy/authorization."),
+    dict(path="rc-info", name="RC Info (disabled alias)", icon="🔒", category="Vehicle",
+         native="vehicle_report", mode="native", timeout=1, cache_ttl=0,
+         params=[P("rc", "XX00XX0000")],
+         desc="Disabled for privacy/authorization."),
 
     # ---------- New: family + email ----------
-    dict(path="family", name="Family / Linked Numbers", icon="👨‍👩‍👧", category="Leak OSINT",
-         native="family", mode="native", timeout=70, cache_ttl=43200,
-         params=[P("q", "9058390341")],
-         desc="⭐ Number ya naam daalo → uske linked/family members ke numbers (same address, "
-              "same father, alt numbers) ek card me. &format=text se ready message, &deep=0 se fast."),
-    dict(path="num-family", name="Family (alias)", icon="👨‍👩‍👧", category="Leak OSINT",
-         native="family", mode="native", timeout=70, cache_ttl=43200,
-         params=[P("q", "Pramila Hembram")],
-         desc="Alias of /api/family - naam se bhi search kar sakte hain."),
-    dict(path="email-info", name="Email OSINT", icon="📧", category="Email",
-         native="email_info", mode="native", timeout=60, cache_ttl=43200,
-         params=[P("email", "ranjitkumarlalgonv@gamil.com")],
-         desc="⭐ Email → provider, MX/SPF records, Gravatar, disposable check + leak/combo records "
-              "(naam, phone, address, leaked passwords). &format=text se card."),
-    dict(path="email", name="Email OSINT (alias)", icon="📧", category="Email",
-         native="email_info", mode="native", timeout=60, cache_ttl=43200,
-         params=[P("email", "test@gmail.com")],
-         desc="Alias of /api/email-info."),
+    dict(path="family", name="Family / Linked Numbers (disabled)", icon="🔒", category="Privacy",
+         native="family", mode="native", timeout=1, cache_ttl=0,
+         params=[P("q", "")],
+         desc="Disabled for privacy; family links and alternate personal numbers are not searched or returned."),
+    dict(path="num-family", name="Family (disabled alias)", icon="🔒", category="Privacy",
+         native="family", mode="native", timeout=1, cache_ttl=0,
+         params=[P("q", "")],
+         desc="Disabled for privacy; no family-member search."),
+    dict(path="email-info", name="Email OSINT (disabled)", icon="🔒", category="Privacy",
+         native="email_info", mode="native", timeout=1, cache_ttl=0,
+         params=[P("email", "")],
+         desc="Disabled; no leaked email/phone/address/password records are searched or returned."),
+    dict(path="email", name="Email OSINT (disabled alias)", icon="🔒", category="Privacy",
+         native="email_info", mode="native", timeout=1, cache_ttl=0,
+         params=[P("email", "")],
+         desc="Disabled for privacy."),
     dict(path="pass-check", name="Password Breach Check", icon="🔑", category="Email",
          native="pass_check", mode="native", timeout=30, cache_ttl=86400,
-         params=[P("password", "Katihar@123")],
+         params=[P("password", "Example-Only-Not-A-Secret-7Q")],
          desc="Password kisi breach me hai ya nahi (Pwned Passwords k-anonymity - password server "
               "se bahar nahi jata)."),
 
     # ---------- Aadhaar family + YouTube downloader ----------
-    dict(path="aadhaar-family", name="Aadhaar Family Intel", icon="📜", category="Aadhaar",
-         native="aadhaar_family", mode="native", timeout=70, cache_ttl=43200,
-         params=[P("aadhaar", "861313813129")],
-         desc="⭐ 12-digit Aadhaar/UID daalo → parivar ke members (masked Aadhaar, head of family "
-              "crown, relation) + district/state. &format=text se ready card."),
-    dict(path="aadhaar", name="Aadhaar Family (alias)", icon="📜", category="Aadhaar",
-         native="aadhaar_family", mode="native", timeout=70, cache_ttl=43200,
-         params=[P("aadhaar", "300664932743")],
-         desc="Alias of /api/aadhaar-family."),
-    dict(path="ration", name="Ration / Family (alias)", icon="🎫", category="Aadhaar",
-         native="aadhaar_family", mode="native", timeout=70, cache_ttl=43200,
-         params=[P("q", "861313813129")],
-         desc="Alias of /api/aadhaar-family (ration card number se bhi try karein)."),
+    dict(path="aadhaar-family", name="Aadhaar Family Intel (disabled)", icon="🔒", category="Privacy",
+         native="aadhaar_family", mode="native", timeout=1, cache_ttl=0,
+         params=[P("aadhaar", "")],
+         desc="Disabled for privacy. Apne record ke liye UIDAI/NFSA ke official consent-based portal ka use karein."),
+    dict(path="aadhaar", name="Aadhaar Family (disabled alias)", icon="🔒", category="Privacy",
+         native="aadhaar_family", mode="native", timeout=1, cache_ttl=0,
+         params=[P("aadhaar", "")],
+         desc="Disabled for privacy; Aadhaar is not sent to a third-party lookup service."),
+    dict(path="ration", name="Ration / Family (disabled alias)", icon="🔒", category="Privacy",
+         native="aadhaar_family", mode="native", timeout=1, cache_ttl=0,
+         params=[P("q", "")],
+         desc="Disabled for privacy; official NFSA portal may require account/OTP/CAPTCHA."),
     dict(path="youtube-download", name="YouTube Downloader", icon="⬇️", category="YouTube",
          native="youtube_download", mode="native", timeout=70, cache_ttl=3600,
          params=[P("url", "https://youtube.com/watch?v=X8X-XyK4CYE")],
@@ -3346,6 +3351,34 @@ ENDPOINTS: List[Dict[str, Any]] = [
 ]
 
 ENDPOINT_MAP = {e["path"]: e for e in ENDPOINTS}
+
+# These routes are intentionally unavailable: they would expose personal records or
+# live vehicle-owner/challan data without a verified authorization path.
+PRIVACY_DISABLED_ENDPOINTS = {
+    "num-info", "number-info", "num", "leak-v1", "leak-v2",
+    "family", "num-family", "email-info", "email",
+    "aadhaar-family", "aadhaar", "ration", "vehicle-report", "vehicle-full", "rc-info",
+} | {e["path"] for e in ENDPOINTS if e["path"].startswith("vehicle-")}
+DISABLED_RECORD_CATEGORIES = {"leak", "phone", "vehicle"}
+
+
+def safe_endpoint_allowlist(value: Any) -> Optional[str]:
+    """Reject key/reseller plans that try to sell privacy-disabled or unknown routes."""
+    if isinstance(value, (list, tuple, set)):
+        items = [str(x).strip() for x in value if str(x).strip()]
+    else:
+        raw = str(value or "*").strip() or "*"
+        if raw.lower() in ("*", "all"):
+            return "*"
+        items = [x.strip() for x in raw.split(",") if x.strip()]
+    if not items:
+        return "*"
+    known = set(ENDPOINT_MAP)
+    if any(item not in known or item in PRIVACY_DISABLED_ENDPOINTS or item.startswith("vehicle-")
+           for item in items):
+        return None
+    return ",".join(dict.fromkeys(items))
+
 
 # If an upstream version is down (HTTP 502 / "Unauthorized"), try a sibling version automatically.
 FALLBACKS = {
@@ -3488,8 +3521,36 @@ def error_payload(ep: Dict[str, Any], message: str, hint: Optional[str] = None) 
 async def run_endpoint(request: Request, ep: Dict[str, Any],
                        extra_params: Optional[Dict[str, Any]] = None) -> JSONResponse:
     started = time.time()
+    path = ep.get("path", "")
+    if path in PRIVACY_DISABLED_ENDPOINTS:
+        key = request.query_params.get("key", DEMO_KEY)
+        ok, _key_used, key_error = validate_key(key)
+        if not ok:
+            return JSONResponse(error_payload(ep, key_error), status_code=401)
+        if path.startswith("vehicle-") or path in {"vehicle-report", "vehicle-full", "rc-info"}:
+            message = "Live vehicle/owner/challan lookup disabled hai jab tak authorized provider configure na ho. Official Parivahan/e-Challan portal use karein."
+            links = {
+                "vahan": "https://vahan.parivahan.gov.in/nrservices/faces/user/searchstatus.xhtml",
+                "echallan": "https://echallan.parivahan.gov.in/index/accused-challan",
+            }
+        elif path.startswith("aadhaar") or path == "ration":
+            message = "Aadhaar/family lookup yahan available nahi. UIDAI/NFSA ke official consent-based portal ka use karein."
+            links = {"uidai": "https://myaadhaar.uidai.gov.in/", "nfsa": "https://nfsa.gov.in/"}
+        else:
+            message = "Leaked personal-record lookup yahan supported nahi. Sirf non-sensitive phone metadata aur official safety links use karein."
+            links = {"report_spam": "https://sancharsaathi.gov.in/"}
+        return JSONResponse({
+            "success": False, "status": "disabled", "endpoint": path,
+            "error": message, "official_links": links,
+            "powered_by": brand(),
+        }, status_code=410)
+
     params = {k: v for k, v in (extra_params if extra_params is not None else request.query_params).items()
               if k not in ("key", "nocache", "_", "format")}
+    if ep["path"] == "imei":
+        # IMEI ka serial/check digit personal device identifier hai; sirf TAC cache/log/upstream tak jaata hai.
+        raw_tac = clean_number(params.get("tac") or params.get("imei") or params.get("q") or "")
+        params = {"imei": raw_tac[:8]} if len(raw_tac) >= 8 else {"imei": raw_tac}
     api_key = request.query_params.get("key", DEMO_KEY)
 
     # --- api key ---
@@ -3821,6 +3882,10 @@ async def admin_list_records(request: Request, category: str = "", q: str = "", 
 async def admin_add_record(request: Request, payload: Dict[str, Any] = Body(default={})):
     require_admin(request)
     category = (payload.get("category") or "general").strip().lower()
+    if category in DISABLED_RECORD_CATEGORIES:
+        return JSONResponse({"success": False, "status": "disabled",
+                             "error": "Leak/phone/vehicle personal-record storage privacy ke liye disabled hai."},
+                            status_code=410)
     key_value = str(payload.get("key_value") or "").strip().lower()
     data = payload.get("data")
     if isinstance(data, str):
@@ -3845,6 +3910,11 @@ async def admin_add_record(request: Request, payload: Dict[str, Any] = Body(defa
 async def admin_update_record(record_id: int, request: Request,
                               payload: Dict[str, Any] = Body(default={})):
     require_admin(request)
+    new_category = payload.get("category")
+    if new_category is not None and str(new_category).strip().lower() in DISABLED_RECORD_CATEGORIES:
+        return JSONResponse({"success": False, "status": "disabled",
+                             "error": "Leak/phone/vehicle personal-record storage privacy ke liye disabled hai."},
+                            status_code=410)
     data = payload.get("data")
     if isinstance(data, str):
         try:
@@ -3852,10 +3922,15 @@ async def admin_update_record(record_id: int, request: Request,
         except Exception:
             data = {"value": data}
     with db() as conn:
+        existing = conn.execute("SELECT category FROM custom_records WHERE id=?", (record_id,)).fetchone()
+        if existing and str(existing["category"]).strip().lower() in DISABLED_RECORD_CATEGORIES:
+            return JSONResponse({"success": False, "status": "disabled",
+                                 "error": "Purane private-record rows edit nahi hote; unhe delete kar sakte hain."},
+                                status_code=410)
         conn.execute(
             "UPDATE custom_records SET category=COALESCE(?,category), key_value=COALESCE(?,key_value),"
             " data=COALESCE(?,data), note=COALESCE(?,note), updated_at=? WHERE id=?",
-            (payload.get("category"), payload.get("key_value"),
+            (new_category, payload.get("key_value"),
              json.dumps(data, ensure_ascii=False) if data is not None else None,
              payload.get("note"), now_ist(), record_id))
         conn.commit()
@@ -3876,6 +3951,10 @@ async def admin_import_records(request: Request, payload: Dict[str, Any] = Body(
     require_admin(request)
     text = payload.get("csv") or payload.get("text") or ""
     category = (payload.get("category") or "general").strip().lower()
+    if category in DISABLED_RECORD_CATEGORIES:
+        return JSONResponse({"success": False, "status": "disabled",
+                             "error": "Leak/phone/vehicle personal-record import privacy ke liye disabled hai."},
+                            status_code=410)
     added = 0
     reader = csv.reader(io.StringIO(text))
     with db() as conn:
@@ -3953,7 +4032,11 @@ async def admin_create_key(request: Request, payload: Dict[str, Any] = Body(defa
         new_key = "osint-" + "".join(secrets.choice(alphabet) for _ in range(24))
     days = int(payload.get("days") or 0)
     expires_at = (datetime.now(IST) + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S") if days > 0 else None
-    endpoints = (payload.get("allowed_endpoints") or payload.get("plan") or "*").strip() or "*"
+    endpoints = safe_endpoint_allowlist(payload.get("allowed_endpoints") or payload.get("plan") or "*")
+    if endpoints is None:
+        return JSONResponse({"success": False, "status": "disabled",
+                             "error": "Privacy-disabled ya unknown endpoint ko plan me bech nahi sakte."},
+                            status_code=410)
     with db() as conn:
         exists = conn.execute("SELECT id FROM api_keys WHERE api_key=?", (new_key,)).fetchone()
         if exists:
@@ -4007,8 +4090,13 @@ async def admin_set_plan(key_id: int, request: Request,
     require_admin(request)
     fields, values = [], []
     if payload.get("allowed_endpoints") is not None:
+        endpoints = safe_endpoint_allowlist(payload["allowed_endpoints"])
+        if endpoints is None:
+            return JSONResponse({"success": False, "status": "disabled",
+                                 "error": "Privacy-disabled ya unknown endpoint ko plan me bech nahi sakte."},
+                                status_code=410)
         fields.append("allowed_endpoints=?")
-        values.append((payload["allowed_endpoints"] or "*").strip() or "*")
+        values.append(endpoints)
     if payload.get("device_lock") is not None:
         fields.append("device_lock=?")
         values.append(int(payload["device_lock"]))
@@ -4292,7 +4380,11 @@ async def reseller_create_key(request: Request, payload: Dict[str, Any] = Body(d
         return JSONResponse({"success": False,
                              "error": f"Aap max {row['max_days']} din ka key bana sakte ho"},
                             status_code=403)
-    endpoints = (payload.get("allowed_endpoints") or "*").strip()
+    endpoints = safe_endpoint_allowlist(payload.get("allowed_endpoints") or "*")
+    if endpoints is None:
+        return JSONResponse({"success": False, "status": "disabled",
+                             "error": "Privacy-disabled ya unknown endpoint ko reseller plan me bech nahi sakte."},
+                            status_code=410)
     if not endpoint_subset_ok(endpoints, row["allowed_endpoints"]):
         return JSONResponse({"success": False,
                              "error": "Ye endpoints aapke plan me nahi hain",
@@ -4364,6 +4456,11 @@ async def admin_create_reseller(request: Request, payload: Dict[str, Any] = Body
     password = payload.get("password") or ""
     if not username or not password:
         return JSONResponse({"success": False, "error": "username + password chahiye"}, status_code=400)
+    reseller_endpoints = safe_endpoint_allowlist(payload.get("allowed_endpoints") or "*")
+    if reseller_endpoints is None:
+        return JSONResponse({"success": False, "status": "disabled",
+                             "error": "Privacy-disabled ya unknown endpoint reseller ko assign nahi kar sakte."},
+                            status_code=410)
     with db() as conn:
         if conn.execute("SELECT id FROM resellers WHERE username=?", (username,)).fetchone():
             return JSONResponse({"success": False, "error": "Username already exists"}, status_code=400)
@@ -4371,7 +4468,7 @@ async def admin_create_reseller(request: Request, payload: Dict[str, Any] = Body
                      "allowed_endpoints,credit,keys_created,created_at) VALUES(?,?,?,?,1,?,?,?,0,?)",
                      (username, hash_pw(password), payload.get("name", ""),
                       payload.get("telegram", ""), int(payload.get("max_days") or 30),
-                      (payload.get("allowed_endpoints") or "*").strip() or "*",
+                      reseller_endpoints,
                       int(payload.get("credit") or 0), now_ist()))
         conn.commit()
     return {"success": True, "username": username, "password": password,
@@ -4394,13 +4491,19 @@ async def admin_reseller_credit(rid: int, request: Request,
 async def admin_reseller_plan(rid: int, request: Request,
                               payload: Dict[str, Any] = Body(default={})):
     require_admin(request)
+    endpoints = None
+    if payload.get("allowed_endpoints") is not None:
+        endpoints = safe_endpoint_allowlist(payload["allowed_endpoints"])
+        if endpoints is None:
+            return JSONResponse({"success": False, "status": "disabled",
+                                 "error": "Privacy-disabled ya unknown endpoint reseller ko assign nahi kar sakte."},
+                                status_code=410)
     with db() as conn:
         if payload.get("max_days") is not None:
             conn.execute("UPDATE resellers SET max_days=? WHERE id=?",
                          (int(payload["max_days"]), rid))
-        if payload.get("allowed_endpoints") is not None:
-            conn.execute("UPDATE resellers SET allowed_endpoints=? WHERE id=?",
-                         ((payload["allowed_endpoints"] or "*").strip() or "*", rid))
+        if endpoints is not None:
+            conn.execute("UPDATE resellers SET allowed_endpoints=? WHERE id=?", (endpoints, rid))
         conn.commit()
     return {"success": True}
 
@@ -4432,29 +4535,56 @@ def gen_order_code() -> str:
 
 
 def store_plans() -> List[Dict[str, Any]]:
+    """Only advertise working endpoints; filter privacy-disabled paths from saved plans too."""
     raw = get_setting("store_plans", "")
     if raw:
         try:
             data = json.loads(raw)
             if isinstance(data, list) and data:
-                return data
+                safe_plans = []
+                for item in data:
+                    if not isinstance(item, dict):
+                        continue
+                    plan = dict(item)
+                    raw_eps = plan.get("endpoints", "*")
+                    if isinstance(raw_eps, (list, tuple, set)):
+                        eps = [str(x).strip() for x in raw_eps if str(x).strip()]
+                        wildcard = False
+                    else:
+                        raw_eps = str(raw_eps or "*").strip()
+                        wildcard = raw_eps in ("*", "all", "")
+                        eps = [] if wildcard else [x.strip() for x in raw_eps.split(",") if x.strip()]
+                    if not wildcard:
+                        includes_disabled = any(x in PRIVACY_DISABLED_ENDPOINTS or x.startswith("vehicle-")
+                                                for x in eps)
+                        if includes_disabled:
+                            continue
+                        if not eps:
+                            continue
+                        plan["endpoints"] = ",".join(eps)
+                    else:
+                        note = "Privacy-restricted personal-data/Aadhaar/email/vehicle-owner routes disabled hain."
+                        description = str(plan.get("description") or "").strip()
+                        if note not in description:
+                            plan["description"] = (description + " " + note).strip()
+                    safe_plans.append(plan)
+                if safe_plans:
+                    return safe_plans
         except Exception:
             pass
     return [
-        {"id": "trial", "name": "Trial Pack", "days": 3, "endpoints": "num-info,family",
-         "price": 29, "description": "3 din · Number + Family API"},
-        {"id": "num", "name": "Number Pack", "days": 30, "endpoints": "num-info,family,num,number-info",
-         "price": 100, "description": "30 din · Number + Family report"},
-        {"id": "vehicle", "name": "Vehicle Pack", "days": 30,
-         "endpoints": "vehicle-report,vehicle-full,rc-info,vehicle-rc,vehicle-challan",
-         "price": 100, "description": "30 din · RC + Challan full report"},
-        {"id": "aadhaar", "name": "Aadhaar Pack", "days": 30,
-         "endpoints": "aadhaar-family,aadhaar,ration",
-         "price": 150, "description": "30 din · Aadhaar family intel"},
+        {"id": "trial", "name": "Utility Trial", "days": 3,
+         "endpoints": "imei,ip-v1,ifsc,pincode", "price": 29,
+         "description": "3 din · TAC-only device hint, IP, IFSC aur pincode utilities"},
+        {"id": "utility", "name": "Utility Pack", "days": 30,
+         "endpoints": "imei,ip-v1,ip-v2,ip-v3,ifsc,pincode,youtube-download,ytdl,youtube-mp3",
+         "price": 100, "description": "30 din · available utility APIs (₹100/month per key)"},
         {"id": "full", "name": "Full Access", "days": 30, "endpoints": "*",
-         "price": 299, "description": "30 din · SARE 59 endpoints"},
+         "price": 299,
+         "description": "30 din · currently available APIs; privacy-restricted lookups disabled"},
         {"id": "reseller", "name": "Reseller Pack", "days": 365, "endpoints": "*",
-         "price": 999, "description": "1 saal · Full access (resale allowed)"},
+         "price": 999,
+         "description": "1 saal · available APIs ke reseller access; privacy-restricted lookups disabled"},
     ]
 
 
@@ -4876,7 +5006,7 @@ align-items:center;justify-content:center;font-weight:700;font-size:14px}
   <label>Aapka naam</label>
   <input id="custName" placeholder="Rohit Kumar">
   <label>WhatsApp / Phone (optional)</label>
-  <input id="custPhone" placeholder="919973700984">
+  <input id="custPhone" placeholder="0000000000">
   <button class="btn" style="margin-top:12px;width:100%" onclick="createOrder()">💳 Pay &amp; Get Key</button>
 
   <div class="paybox" id="paybox" style="display:none">
@@ -4900,16 +5030,14 @@ align-items:center;justify-content:center;font-weight:700;font-size:14px}
   <h2>🔍 Live Demo (Demo key se)</h2>
   <label>Kya check karna hai</label>
   <select id="demoEp" onchange="demoChanged()">
-    <option value="num-info|q|919973700984">Number Info</option>
-    <option value="vehicle-report|number|BR30AR0802">Vehicle RC + Challan</option>
-    <option value="family|q|919973700984">Family / Linked Numbers</option>
-    <option value="aadhaar-family|aadhaar|861313813129">Aadhaar Family</option>
-    <option value="email-info|email|test@gmail.com">Email OSINT</option>
-    <option value="pass-check|password|Katihar@123">Password Breach Check</option>
+    <option value="imei|imei|35301011">IMEI — TAC-only device hint</option>
+    <option value="ip-v1|query|8.8.8.8">IP Info</option>
+    <option value="ifsc|ifsc|SBIN0000001">IFSC branch info</option>
+    <option value="pincode|pincode|110001">Pincode info</option>
     <option value="youtube-download|url|https://youtube.com/watch?v=X8X-XyK4CYE">YouTube Download</option>
   </select>
   <label>Value</label>
-  <input id="demoVal" value="919973700984">
+  <input id="demoVal" value="35301011">
   <button class="btn" style="margin-top:10px;width:100%" onclick="runDemo()">▶ Try Now</button>
   <pre id="demoOut">Yahan live result aayega…</pre>
 </div>
@@ -4945,7 +5073,7 @@ function renderPlans(){
   document.getElementById('plans').innerHTML = PLANS.map((p,i)=>
     '<div class="plan '+(i===1?'pop':'')+'"><h3>'+p.name+(i===1?' 🌟':'')+'</h3>'+
     '<div class="price">₹'+p.price+' <small>/ '+p.days+' din</small></div>'+
-    '<ul><li>'+p.description+'</li><li>Endpoints: '+(p.endpoints==='*'?'SAB (59)':p.endpoints.split(',').length+' APIs')+'</li>'+
+    '<ul><li>'+p.description+'</li><li>Endpoints: '+(p.endpoints==='*'?'Available APIs (restricted routes disabled)':p.endpoints.split(',').length+' APIs')+'</li>'+
     '<li>Instant activation · Device lock option</li></ul></div>').join('');
   const sel = document.getElementById('planSel');
   sel.innerHTML = PLANS.map(p=>'<option value="'+p.id+'">'+p.name+' — ₹'+p.price+' / '+p.days+' din</option>').join('');
@@ -4991,7 +5119,7 @@ async function pollOrder(){
     document.getElementById('keyBox').innerHTML =
       '<pre>🔑 Aapki API KEY:\n'+j.api_key+'\n\n📦 Plan: '+j.plan+
       '\n⏳ Valid: '+j.days+' din\n💰 Paid: ₹'+j.amount+'\n\n'+
-      'Example:\n'+location.origin+'/api/num-info?key='+j.api_key+'&q=919973700984&format=text</pre>';
+      'Safe example:\n'+location.origin+'/api/imei?key='+j.api_key+'&imei=35301011</pre>';
   }
 }
 async function runDemo(){
@@ -5021,7 +5149,7 @@ renderPlans();
 
 def render_store(request: Request) -> HTMLResponse:
     title = get_setting("store_title", "OSINT API Hub") or "OSINT API Hub"
-    tagline = get_setting("store_tagline", "") or "59 Powerful APIs"
+    tagline = get_setting("store_tagline", "") or "Utility APIs — privacy-restricted personal lookups disabled"
     support = get_setting("telegram_support", "") or brand()
     support_link = (f"https://t.me/{support.lstrip('@')}" if support.startswith("@")
                     else (support if support.startswith("http") else "#"))
@@ -5175,23 +5303,21 @@ a{color:#79c0ff}
     <div class="row">
       <div><label>Category</label>
         <select id="recCategory">
-          <option value="leak">leak (leak OSINT)</option>
-          <option value="phone">phone (num-info)</option>
           <option value="gst">gst</option>
           <option value="pan">pan</option>
-          <option value="vehicle">vehicle</option>
-          <option value="imei">imei</option>
+          <option value="imei">imei (TAC only)</option>
           <option value="ip">ip</option>
           <option value="general">general</option>
         </select>
       </div>
-      <div><label>Key (phone / GSTIN / PAN / number)</label>
-        <input id="recKey" placeholder="919973700984"></div>
+      <div><label>Key (non-private utility identifier)</label>
+        <input id="recKey" placeholder="SAFE-KEY"></div>
     </div>
     <label>Data (JSON)</label>
-    <textarea id="recData">{"full_name":"Example Name","address":"Bihar","phone":"919973700984"}</textarea>
+    <textarea id="recData">{"label":"Example safe utility record"}</textarea>
+    <p style="color:var(--muted)">Leak/phone/vehicle owner records ka manual storage/import privacy ke liye disabled hai. Aadhaar ya personal data yahan upload na karein.</p>
     <label>Note (optional)</label>
-    <input id="recNote" placeholder="kahan se mila">
+    <input id="recNote" placeholder="safe source note">
     <button class="action" onclick="addRecord()">Save Record</button>
   </div>
 
@@ -5212,11 +5338,11 @@ a{color:#79c0ff}
     <p style="color:var(--muted);margin-top:0">Format: <code>key,json_or_value,note</code> - har line ek record.</p>
     <div class="row"><div><label>Category</label>
       <select id="impCategory">
-        <option value="leak">leak</option><option value="phone">phone</option>
         <option value="gst">gst</option><option value="pan">pan</option>
-        <option value="vehicle">vehicle</option><option value="general">general</option>
+        <option value="imei">imei (TAC only)</option><option value="ip">ip</option>
+        <option value="general">general</option>
       </select></div></div>
-    <textarea id="impCsv" placeholder="919973700984,{&quot;full_name&quot;:&quot;Ram Kumar&quot;},from telegram"></textarea>
+    <textarea id="impCsv" placeholder="SAFE-KEY,{&quot;label&quot;:&quot;Example utility record&quot;},safe source"></textarea>
     <button class="action" onclick="importCsv()">Import</button>
   </div>
 </div>
@@ -5240,19 +5366,17 @@ a{color:#79c0ff}
       </div>
     </div>
     <div class="row">
-      <div><label>Plan (kaunsi API)</label>
+      <div><label>Plan (available APIs only; privacy-restricted routes disabled)</label>
         <select id="keyPlan" onchange="togglePlanBox()">
-          <option value="*">SAB endpoints (full access)</option>
-          <option value="num-info,vehicle-report,family,email-info">Popular pack (num-info + vehicle-report + family + email-info)</option>
-          <option value="num-info,family">Sirf Number pack (num-info + family)</option>
-          <option value="vehicle-report,vehicle-rc,vehicle-challan">Sirf Vehicle pack</option>
-          <option value="email-info,pass-check">Sirf Email pack</option>
-          <option value="custom">Custom (khud likho)</option>
+          <option value="*">All currently available APIs (restricted routes remain disabled)</option>
+          <option value="imei,ip-v1,ifsc,pincode">Utility Starter (TAC / IP / IFSC / Pincode)</option>
+          <option value="imei,ip-v1,ip-v2,ip-v3,ifsc,pincode,youtube-download,ytdl,youtube-mp3">Utility Pack — ₹100 / month</option>
+          <option value="custom">Custom (sirf available endpoints)</option>
         </select>
       </div>
       <div id="customPlanBox" style="display:none">
-        <label>Endpoints (comma separated)</label>
-        <input id="keyEndpoints" placeholder="num-info,vehicle-report">
+        <label>Endpoints (comma separated; disabled paths reject honge)</label>
+        <input id="keyEndpoints" placeholder="imei,ip-v1,ifsc,pincode">
       </div>
     </div>
     <div class="row">
@@ -5426,10 +5550,10 @@ a{color:#79c0ff}
     </div>
     <div class="row">
       <div><label>Website title</label><input id="stTitle" placeholder="OSINT API Hub"></div>
-      <div><label>Website tagline</label><input id="stTagline" placeholder="59 Powerful APIs..."></div>
+      <div><label>Website tagline</label><input id="stTagline" placeholder="Utility APIs — restricted lookups disabled"></div>
     </div>
     <div class="row"><div><label>Plans JSON (advanced - khali chhod do to default plans)</label>
-      <textarea id="stPlans" placeholder='[{"id":"num","name":"Number Pack","days":30,"endpoints":"num-info,family","price":100,"description":"30 din"}]'></textarea></div></div>
+      <textarea id="stPlans" placeholder='[{"id":"utility","name":"Utility Pack","days":30,"endpoints":"imei,ip-v1,ifsc,pincode","price":100,"description":"30 din — privacy-restricted endpoints disabled"}]'></textarea></div></div>
     <button class="action" onclick="saveSettings()">Save Settings</button>
     <button class="ghost" onclick="clearCache()">🧹 Clear Cache</button>
   </div>
@@ -5713,16 +5837,16 @@ async function showCustomerMsg(id){
     const k = (j.keys||[]).find(x=>x.id===id);
     if(!k) return;
     const base = location.origin;
-    const plan = (k.allowed_endpoints==='*'||!k.allowed_endpoints)?'All endpoints':k.allowed_endpoints;
+    const plan = (k.allowed_endpoints==='*'||!k.allowed_endpoints)?'Available endpoints (privacy-restricted routes disabled)':k.allowed_endpoints;
     const msg = '✅ Aapka OSINT API key ready hai\n\n'+
       '🔑 Key: '+k.api_key+'\n'+
       '📦 Plan: '+plan+'\n'+
       '⏳ Valid till: '+(k.expires_at||'Lifetime')+'\n\n'+
       '📌 Examples:\n'+
-      base+'/api/num-info?key='+k.api_key+'&q=919973700984&format=text\n'+
-      base+'/api/vehicle-report?key='+k.api_key+'&number=BR30AR0802&format=text\n'+
-      base+'/api/family?key='+k.api_key+'&q=919973700984&format=text\n'+
-      base+'/api/email-info?key='+k.api_key+'&email=test@gmail.com&format=text\n\n'+
+      base+'/api/imei?key='+k.api_key+'&imei=35301011\n'+
+      base+'/api/ifsc?key='+k.api_key+'&ifsc=SBIN0000001\n'+
+      base+'/api/pincode?key='+k.api_key+'&pincode=110001\n\n'+
+      '🔒 Personal-record/Aadhaar/email/vehicle-owner routes privacy ke liye disabled hain.\n\n'+
       '🔎 Apni key check karo: '+base+'/api/key-info?key='+k.api_key;
     prompt('Ye message copy kar ke customer ko bhej do:', msg);
   }catch(e){}
