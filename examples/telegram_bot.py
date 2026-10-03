@@ -60,7 +60,7 @@ def api_get(path: str, **params) -> str:
                 return (f"🔒 {data.get('status', 'blocked').upper()}\n{data.get('error', '')}\n"
                         f"{data.get('hint', '')}")
             except Exception:
-                return f"🔒 Blocked (HTTP 403). Key expired ya plan me nahi hai."
+                return "🔒 Blocked (HTTP 403). Key expired ya plan me nahi hai."
         if r.status_code != 200:
             return f"⚠️ API error: HTTP {r.status_code}\n{r.text[:300]}"
         return r.text.strip() or "❌ Empty response"

@@ -6,7 +6,6 @@ Admin password optional hai (khali chhodo to sirf public check hoga).
 Koi secret file me save nahi hota.
 """
 import json
-import io
 import os
 import sys
 import time

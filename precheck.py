@@ -17,7 +17,6 @@ Exit code 0 = sab theek (push kar do), 1 = matlab koi problem hai.
 """
 from __future__ import annotations
 
-import asyncio
 import inspect
 import sys
 

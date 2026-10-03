@@ -22,7 +22,6 @@ Optional settings:
   SUPPORT       = "@Supermannn_x"
 """
 
-import json
 import time
 
 import requests

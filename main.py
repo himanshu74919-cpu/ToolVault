@@ -1544,7 +1544,7 @@ async def native_imei(params: Dict[str, Any], request: Request) -> Tuple[Optiona
 
     # 1) admin ke apne records (custom DB, category=tac)
     own = custom_lookup("tac", tac)
-    brand = model = device = extra = ""
+    brand = device = extra = ""
     source = ""
     if own:
         rec = own[0]
@@ -1559,16 +1559,17 @@ async def native_imei(params: Dict[str, Any], request: Request) -> Tuple[Optiona
             device = hit["device"]
             extra = hit["extra"]
             source = f"tac-db ({_tac_state.get('count', 0)} rows)"
-    # 3) purana chhota local catalog (fallback)
-    if not device:
-        b2, m2 = TAC_HINTS.get(tac, TAC_HINTS.get(tac[:6], TAC_HINTS.get(tac[:4], (None, None))))
-        if b2 or m2:
-            brand, device, source = (b2 or ""), (m2 or ""), "local-catalog"
+    # 3) purana chhota local catalog (fallback + readable model casing)
+    b2, m2 = TAC_HINTS.get(tac, TAC_HINTS.get(tac[:6], TAC_HINTS.get(tac[:4], (None, None))))
+    if not device and (b2 or m2):
+        brand, device, source = (b2 or ""), (m2 or ""), "local-catalog"
     known = bool(device or brand)
     device = device or ""
     model_short = device
     if brand and device.upper().startswith(brand.upper()):
         model_short = device[len(brand):].strip()
+    if m2 and model_short.upper() == m2.upper():
+        model_short = m2
 
     result: Dict[str, Any] = {
         "success": known,
@@ -1597,6 +1598,8 @@ async def native_imei(params: Dict[str, Any], request: Request) -> Tuple[Optiona
                                "sections": sp["sections"], "row_count": sp["row_count"]}
             result["image"] = sp["image"]
             result["specs_source"] = sp["source"]
+        else:
+            result["specs_pending"] = True
         # Wikipedia: model codes (SM-X210…) + release year + badi image
         try:
             wiki = await _wiki_device_extra(device or model_short)
@@ -1802,7 +1805,6 @@ def parse_vehicle(number: str) -> Dict[str, Any]:
     # BH-series (Bharat series) handling
     if state == "BH":
         info["state"] = "Bharat Series (BH - all India)"
-        ym = re.match(r"^(\d{2})BH(\d{4})([A-Z]{1,2})$", clean)
         info["bharat_series"] = True
     # Rough class guess based on Indian registration conventions (honest about being a guess)
     info["vehicle_class_guess"] = ("Unknown - RTO database required "
