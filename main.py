@@ -41,7 +41,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 # =====================================================================
 # CONFIGURATION  (everything can be changed from the dashboard too)
 # =====================================================================
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.3.1"
 DB_PATH = os.environ.get("DB_PATH", "osint_database.db")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -2825,8 +2825,13 @@ async def _provider_loaderto(vid: str, watch: str, mode: str, budget: float) -> 
 _YT_STATE: Dict[str, float] = {"ytdlp_fail_until": 0.0}
 
 
-def _yt_extract(url: str, mode: str, quality: str, timeout: int = 40) -> Dict[str, Any]:
-    """Blocking yt-dlp extraction (run inside a thread)."""
+def _yt_extract(url: str, mode: str, quality: str, timeout: int = 40,
+                budget: float = 8.0) -> Dict[str, Any]:
+    """Blocking yt-dlp extraction (run inside a thread).
+
+    budget = saare client attempts ka TOTAL time (v2.3.1) — pehle pehli request par
+    yt-dlp 25s kha jata tha aur providers ko time hi nahi milta tha.
+    """
     try:
         import yt_dlp  # optional dependency
     except Exception as exc:
@@ -2855,9 +2860,13 @@ def _yt_extract(url: str, mode: str, quality: str, timeout: int = 40) -> Dict[st
     }
     ytdlp_errs = []
     info = None
+    _t0 = time.time()
     # default clients sabse zyada formats dete hain (24 tk), phir android_vr/android
     # (combined single file — kam quality par hamesha chalta hai)
     for clients in ([], ["android_vr"], ["android"], ["web"], ["ios"]):
+        if time.time() - _t0 > budget:
+            ytdlp_errs.append("budget khatam (blocked IP lagta hai)")
+            break
         opts = dict(base_opts)
         if clients:
             opts["extractor_args"] = {"youtube": {"player_client": clients}}
@@ -2964,7 +2973,9 @@ async def native_youtube_download(params: Dict[str, Any], request: Request) -> T
             try:
                 out = await loop.run_in_executor(
                     None, lambda: _yt_extract(watch, "audio" if mode == "audio" else mode,
-                                              quality, timeout=int(min(25, max(8, hard_deadline - (time.time() - started) - 4)))))
+                                              quality,
+                                              timeout=int(min(25, max(8, hard_deadline - (time.time() - started) - 4))),
+                                              budget=float(min(9, max(4, hard_deadline - (time.time() - started) - 8)))))
             except Exception as exc:  # noqa: BLE001
                 out = {"error": str(exc)[:200]}
             ytdlp_err = out.get("error")
