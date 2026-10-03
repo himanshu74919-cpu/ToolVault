@@ -81,6 +81,27 @@ Isse **operator / circle / number type / MNP ported** live aata hai.
 ⚠️ Leaked personal records (naam-pata wala data) **jaan-boojh kar support nahi** —
 wo illegal hai aur bot ban ho jata hai.
 
+
+### 🌐 RapidAPI / POST-style provider (v2.7.0)
+
+Agar aapki API RapidAPI par hai (sabse aasan!) ya POST leti hai, to ye 4 extra line kaafi hain:
+
+```
+VEHICLE_PROVIDER_URL     = https://vehicle-rc-information.p.rapidapi.com/rc
+VEHICLE_PROVIDER_KEY     = <RapidAPI ki X-RapidAPI-Key>
+VEHICLE_PROVIDER_AUTH    = rapidapi
+VEHICLE_PROVIDER_HEADERS = X-RapidAPI-Key:{key}|X-RapidAPI-Host:vehicle-rc-information.p.rapidapi.com
+VEHICLE_PROVIDER_METHOD  = POST
+VEHICLE_PROVIDER_BODY    = {"vehicle_number":"{number}"}
+```
+
+* `..._HEADERS` — `Naam:Value` pairs, `|` se alag. `{key}` ki jagah aapki key khud lag jati hai.
+* `..._METHOD` — `GET` (default) ya `POST`
+* `..._BODY` — POST ka JSON. `{number}` aur `{key}` apne aap bhar jate hain.
+* `..._PATH` — agar URL base hai aur path alag (jaise `/rc`) to yahan daalo.
+
+`NUMINFO_PROVIDER_*` me bhi **bilkul yahi 5 settings** chalti hain (carrier/HLR ke liye).
+
 ### Status check
 ```
 GET /health   →  "providers": {"vehicle": "on/off", "carrier": "on/off"}

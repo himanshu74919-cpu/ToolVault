@@ -22,6 +22,36 @@ services:
       # Public demo key (khali chhodo = Demo)
       - key: DEMO_KEY
         sync: false
+      # ---------- APNI API (vehicle) — koi bhi provider style ----------
+      - key: VEHICLE_PROVIDER_URL
+        sync: false            # provider ka endpoint
+      - key: VEHICLE_PROVIDER_KEY
+        sync: false            # provider ki key
+      - key: VEHICLE_PROVIDER_AUTH
+        sync: false            # bearer | key | header | query | rapidapi
+      - key: VEHICLE_PROVIDER_HEADERS
+        sync: false            # RapidAPI ke liye: X-RapidAPI-Key:{key}|X-RapidAPI-Host:xxx.p.rapidapi.com
+      - key: VEHICLE_PROVIDER_METHOD
+        sync: false            # GET | POST
+      - key: VEHICLE_PROVIDER_BODY
+        sync: false            # POST body: {"vehicle_number":"{number}"}
+      - key: VEHICLE_PROVIDER_PARAM
+        sync: false            # query param ka naam (default: number)
+      # ---------- APNI API (number/carrier) — same style ----------
+      - key: NUMINFO_PROVIDER_URL
+        sync: false
+      - key: NUMINFO_PROVIDER_KEY
+        sync: false
+      - key: NUMINFO_PROVIDER_AUTH
+        sync: false
+      - key: NUMINFO_PROVIDER_HEADERS
+        sync: false
+      - key: NUMINFO_PROVIDER_METHOD
+        sync: false
+      - key: NUMINFO_PROVIDER_BODY
+        sync: false
+      - key: NUMINFO_PROVIDER_PARAM
+        sync: false
       # ---------- v2.6 PERMANENCE (ZAROORI!) ----------
       # Render free plan par DB file har restart/deploy me udd jati hai.
       # Ye 3 env vars lagao -> aapki API key HAMESHA zinda rahegi:

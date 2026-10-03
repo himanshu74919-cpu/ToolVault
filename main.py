@@ -43,7 +43,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 # =====================================================================
 # CONFIGURATION  (everything can be changed from the dashboard too)
 # =====================================================================
-APP_VERSION = "2.6.9"
+APP_VERSION = "2.7.0"
 DB_PATH = os.environ.get("DB_PATH", "osint_database.db")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -2230,28 +2230,48 @@ NATIVE_FUNCS_PATCHED = True
 # Provider set hone par endpoints khud live ho jate hain. Set na ho to saaf
 # Hinglish message + official links (jhoothe data kabhi nahi).
 # =====================================================================
-def vehicle_provider() -> Dict[str, str]:
+def _provider_cfg(prefix: str) -> Dict[str, str]:
+    """Provider config — simple API, RapidAPI, ya custom headers/POST sab support."""
+    g = lambda n, d="": (os.environ.get(f"{prefix}_{n}") or d).strip()   # noqa: E731
     return {
-        "url": (os.environ.get("VEHICLE_PROVIDER_URL") or "").strip(),
-        "key": (os.environ.get("VEHICLE_PROVIDER_KEY") or "").strip(),
-        "param": (os.environ.get("VEHICLE_PROVIDER_PARAM") or "number").strip() or "number",
-        "header": (os.environ.get("VEHICLE_PROVIDER_HEADER") or "Authorization").strip() or "Authorization",
-        "auth": (os.environ.get("VEHICLE_PROVIDER_AUTH") or "bearer").strip().lower(),
+        "url": g("URL"),
+        "key": g("KEY"),
+        "param": g("PARAM", "number") or "number",
+        "header": g("HEADER", "Authorization") or "Authorization",
+        "auth": (g("AUTH", "bearer") or "bearer").lower(),
+        # v2.7.0: extra headers (jaise RapidAPI: X-RapidAPI-Key + X-RapidAPI-Host)
+        # format: "X-RapidAPI-Key:{key}|X-RapidAPI-Host:my-api.p.rapidapi.com"
+        "headers": g("HEADERS"),
+        "method": (g("METHOD", "GET") or "GET").upper(),
+        # POST body template: {"vehicle_number":"{number}"}  — {number} aur {key} replace honge
+        "body": g("BODY"),
+        "path": g("PATH"),
     }
+
+
+def vehicle_provider() -> Dict[str, str]:
+    return _provider_cfg("VEHICLE_PROVIDER")
 
 
 def numinfo_provider() -> Dict[str, str]:
-    return {
-        "url": (os.environ.get("NUMINFO_PROVIDER_URL") or "").strip(),
-        "key": (os.environ.get("NUMINFO_PROVIDER_KEY") or "").strip(),
-        "param": (os.environ.get("NUMINFO_PROVIDER_PARAM") or "number").strip() or "number",
-        "header": (os.environ.get("NUMINFO_PROVIDER_HEADER") or "Authorization").strip() or "Authorization",
-        "auth": (os.environ.get("NUMINFO_PROVIDER_AUTH") or "bearer").strip().lower(),
-    }
+    return _provider_cfg("NUMINFO_PROVIDER")
 
 
 def _provider_headers(cfg: Dict[str, str]) -> Dict[str, str]:
     key = cfg.get("key") or ""
+    extra = cfg.get("headers") or ""
+    if extra:                                   # v2.7.0: custom/RapidAPI style
+        out: Dict[str, str] = {}
+        for part in extra.replace(",", "|").split("|"):
+            if ":" not in part:
+                continue
+            k, v = part.split(":", 1)
+            k, v = k.strip(), v.strip()
+            if k:
+                out[k] = v.replace("{key}", key).replace("{KEY}", key)
+        if cfg.get("auth") == "rapidapi" and key:
+            out.setdefault("X-RapidAPI-Key", key)
+        return out
     if not key:
         return {}
     auth = cfg.get("auth") or "bearer"
@@ -2446,15 +2466,30 @@ def bot_sections(rc: Dict[str, Any], summary: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def call_provider(cfg: Dict[str, str], number: str, timeout: float = 25.0) -> Any:
-    """Provider API ko call karo — auth style ke saath."""
+    """Provider API ko call karo — GET/POST, custom headers (RapidAPI), query/bearer/key sab."""
     import httpx
+    url = (cfg.get("url") or "").rstrip("/")
+    path = (cfg.get("path") or "").strip()
+    if path:
+        url = url + "/" + path.lstrip("/")
     params = {cfg["param"]: number}
     if cfg.get("key") and (cfg.get("auth") or "") == "query":
         params["key"] = cfg["key"]
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True,
-                                 headers={"User-Agent": UA}) as client:
-        r = await client.get(cfg["url"], params=params, headers=_provider_headers(cfg))
-        if r.status_code == 200:
+    hdrs = {"User-Agent": UA, **_provider_headers(cfg)}
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        if (cfg.get("method") or "GET").upper() == "POST":
+            body_txt = (cfg.get("body") or "").replace("{number}", number).replace(
+                "{key}", cfg.get("key") or "")
+            payload: Any
+            try:
+                payload = json.loads(body_txt) if body_txt else {cfg["param"]: number}
+            except Exception:                                     # noqa: BLE001
+                payload = {cfg["param"]: number}
+            r = await client.post(url, json=payload, headers={**hdrs, "Content-Type": "application/json"},
+                                  params=params if not body_txt else None)
+        else:
+            r = await client.get(url, params=params, headers=hdrs)
+        if r.status_code in (200, 201, 202):
             try:
                 return r.json()
             except Exception:                                    # noqa: BLE001
