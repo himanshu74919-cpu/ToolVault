@@ -43,7 +43,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 # =====================================================================
 # CONFIGURATION  (everything can be changed from the dashboard too)
 # =====================================================================
-APP_VERSION = "2.6.7"
+APP_VERSION = "2.6.8"
 DB_PATH = os.environ.get("DB_PATH", "osint_database.db")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -8535,10 +8535,8 @@ async def on_startup():
         import threading
         if not any(t.name == "hub-db-backup" for t in threading.enumerate()):
             threading.Thread(target=_auto_backup_loop, name="hub-db-backup", daemon=True).start()
-        try:
-            backup_db_to_github("startup")
-        except Exception:
-            pass
+        # v2.6.8: startup par turant backup NAHI (warna naya deploy purane backup ko clobber kar deta hai).
+        # Pehla auto-backup 15 min baad hoga; turant chahiye to POST /admin/backup/github.
 
 
 if __name__ == "__main__":
