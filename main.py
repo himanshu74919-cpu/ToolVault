@@ -41,7 +41,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 # =====================================================================
 # CONFIGURATION  (everything can be changed from the dashboard too)
 # =====================================================================
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.2.1"
 DB_PATH = os.environ.get("DB_PATH", "osint_database.db")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -2555,6 +2555,20 @@ async def native_aadhaar_family(params: Dict[str, Any], request: Request) -> Tup
     }
     payload["formatted"] = format_aadhaar_card(payload)
     return payload, False
+
+# 🐛 v2.2.1 FIX: ye teen naam code me use ho rahe the par KABHI define nahi hue the
+# (_INVIDIOUS_CACHE / INVIDIOUS_INSTANCES / PIPED_INSTANCES → NameError, isliye Invidious
+# aur Piped fallback bilkul dead the). Ab define kar diye.
+_INVIDIOUS_CACHE: Dict[str, Any] = {"at": 0.0, "list": []}
+INVIDIOUS_INSTANCES: List[str] = [
+    "https://inv.nadeko.net", "https://invidious.nerdvpn.de", "https://yewtu.be",
+    "https://invidious.f5.si", "https://iv.melmac.space", "https://invidious.privacyredirect.com",
+]
+PIPED_INSTANCES: List[str] = [
+    "https://pipedapi.kavin.rocks", "https://api.piped.private.coffee",
+    "https://pipedapi.adminforge.de", "https://pipedapi.reallyaweso.me",
+]
+
 
 def _invidious_instance_list() -> List[str]:
     """Public Invidious instance list (30 min cache) + hardcoded backup."""
