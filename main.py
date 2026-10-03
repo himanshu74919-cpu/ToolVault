@@ -43,7 +43,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 # =====================================================================
 # CONFIGURATION  (everything can be changed from the dashboard too)
 # =====================================================================
-APP_VERSION = "2.6.5"
+APP_VERSION = "2.6.6"
 DB_PATH = os.environ.get("DB_PATH", "osint_database.db")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -6020,8 +6020,15 @@ for _ep in ENDPOINTS:
 # ADMIN / MANAGEMENT API  (used by the dashboard)
 # =====================================================================
 def admin_authorized(request: Request) -> bool:
-    token = request.headers.get("x-admin-token", "") or request.query_params.get("token", "")
-    return bool(token) and token == get_setting("admin_password", ADMIN_PASSWORD)
+    token = (request.headers.get("x-admin-token", "") or request.query_params.get("token", "")
+             or request.headers.get("authorization", "").removeprefix("Bearer ").strip())
+    if not token:
+        return False
+    if token == get_setting("admin_password", ADMIN_PASSWORD):
+        return True
+    # v2.6.6: MASTER_API_KEY env wali key se bhi admin access — env kabhi nahi badalta,
+    # isliye password bhool jane / badal jane par bhi dashboard kabhi lock na ho.
+    return bool(MASTER_API_KEYS) and token in MASTER_API_KEYS
 
 
 def require_admin(request: Request):
@@ -6035,8 +6042,9 @@ from fastapi import Body, HTTPException  # noqa: E402  (imported late to keep th
 @app.post("/admin/login")
 async def admin_login(request: Request, payload: Dict[str, Any] = Body(default={})):
     password = payload.get("password", "")
-    if password == get_setting("admin_password", ADMIN_PASSWORD):
-        return {"success": True, "message": "Login ok"}
+    if password == get_setting("admin_password", ADMIN_PASSWORD) or (MASTER_API_KEYS and password in MASTER_API_KEYS):
+        return {"success": True, "message": "Login ok",
+                "note": "MASTER_API_KEY se login" if (MASTER_API_KEYS and password in MASTER_API_KEYS) else ""}
     return JSONResponse({"success": False, "error": "Wrong password"}, status_code=401)
 
 
