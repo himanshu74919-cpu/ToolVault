@@ -43,7 +43,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 # =====================================================================
 # CONFIGURATION  (everything can be changed from the dashboard too)
 # =====================================================================
-APP_VERSION = "2.8.0"
+APP_VERSION = "2.8.1"
 DB_PATH = os.environ.get("DB_PATH", "osint_database.db")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -68,6 +68,32 @@ try:
 except Exception:
     BACKUP_MINUTES = 15.0
 _BACKUP_STATE: Dict[str, Any] = {"restored": None, "last_backup": None, "ok": None, "error": None}
+
+# ---------- v2.8.1 KEEPALIVE (free 24/7, koi bahar ki service nahi) ----------
+# Hub aur bot ek dusre ko ping karte hain -> Render free plan par dono jaagte rehte hain.
+KEEPALIVE_PEERS = [u.strip() for u in (
+    os.environ.get("KEEPALIVE_PEERS") or "https://utility-duniya-bot.onrender.com/health"
+).replace(";", ",").split(",") if u.strip()]
+try:
+    KEEPALIVE_MINUTES = float(os.environ.get("KEEPALIVE_MINUTES") or 9)
+except Exception:
+    KEEPALIVE_MINUTES = 9.0
+_KEEPALIVE_STATE: Dict[str, Any] = {"last_run": None, "last_ok": None, "runs": 0}
+
+
+def keepalive_loop():
+    """Har ~9 min me peers ko ping karo (Render 15 min inactivity par sula deta hai)."""
+    while True:
+        time.sleep(max(120.0, KEEPALIVE_MINUTES * 60))
+        for url in list(KEEPALIVE_PEERS):
+            try:
+                r = httpx.get(url, timeout=90, follow_redirects=True)
+                _KEEPALIVE_STATE.update({"last_run": now_ist("%d-%m-%Y %H:%M"),
+                                         "last_ok": r.status_code < 500,
+                                         "runs": int(_KEEPALIVE_STATE.get("runs") or 0) + 1})
+            except Exception as e:                                    # noqa: BLE001
+                _KEEPALIVE_STATE.update({"last_run": now_ist("%d-%m-%Y %H:%M"),
+                                         "last_ok": False, "last_error": str(e)[:80]})
 
 # ---------- v2.6 DB ko GitHub se wapas lao (import se pehle, sabse pehle) ----------
 def _gh_headers() -> Dict[str, str]:
@@ -7399,6 +7425,14 @@ async def health():
                 "note": ("MASTER_API_KEY wali key restart par bhi chalti hai; baaki keys/records ke liye "
                          "GitHub backup ya Render disk chahiye"),
             },
+            "keepalive": {
+                "peers": KEEPALIVE_PEERS,
+                "every_minutes": KEEPALIVE_MINUTES,
+                "last_run": _KEEPALIVE_STATE.get("last_run"),
+                "last_ok": _KEEPALIVE_STATE.get("last_ok"),
+                "runs": _KEEPALIVE_STATE.get("runs", 0),
+                "note": "Hub apne peer (bot) ko ping karta hai — dono Render free plan par 24/7 jaagte hain",
+            },
             "security": {
                 "admin_password_is_default": (get_setting("admin_password", ADMIN_PASSWORD) == "admin123"),
                 "hint": ("KHATRA: dashboard password abhi default 'admin123' hai — Render env me "
@@ -8659,6 +8693,11 @@ async def on_startup():
                 conn.commit()
         except Exception:
             pass
+    # ---- v2.8.1: keepalive thread (bot ko ping karta rahega -> dono jaagte rehte hain) ----
+    if os.environ.get("KEEPALIVE_ENABLED", "1") != "0" and KEEPALIVE_PEERS:
+        import threading
+        if not any(t.name == "hub-keepalive" for t in threading.enumerate()):
+            threading.Thread(target=keepalive_loop, name="hub-keepalive", daemon=True).start()
     # ---- v2.6: DB ko GitHub par auto-backup (free plan par DB udd jati hai) ----
     if BACKUP_REPO and BACKUP_TOKEN:
         import threading
