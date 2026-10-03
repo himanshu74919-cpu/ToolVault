@@ -51,6 +51,43 @@ Poori list live dekhne ke liye: **`/docs`** (Swagger) ya **`/api`** catalog.
 
 ---
 
+## 🔌 Authorized provider lagana (vehicle + carrier) — v2.6
+
+Jin endpoints par policy rok hai, unhe **aap apni licensed API** se live kar sakte ho.
+Render → Environment me bas ye 2-6 line daalo:
+
+### 🚗 Vehicle / RC / Challan
+```
+VEHICLE_PROVIDER_URL    = https://provider.example/api/vehicle   (aapki API ka endpoint)
+VEHICLE_PROVIDER_KEY    = aapki key
+VEHICLE_PROVIDER_PARAM  = number          (query param ka naam — default "number")
+VEHICLE_PROVIDER_HEADER = Authorization   (header ka naam — default "Authorization")
+VEHICLE_PROVIDER_AUTH   = bearer | key | header | query
+```
+Iske baad `/api/vehicle-rc`, `/api/vehicle-challan`, `/api/vehicle-challan-v4`,
+`/api/vehicle-report` sab **live data** denge — aur aapke bot me
+**🚗 VEHICLE INFO + CHALLAN** tool turant poora report dikhayega (maker, model, fuel,
+owner, RTO, insurance, PUC, fitness aur saare challans amount/offence ke saath).
+
+Provider ka JSON shape koi bhi ho — hub khud map kar leta hai
+(`reg_no` / `registration_number` / `rc_number` … sab chalta hai).
+
+### 📱 Number Info (carrier — legal)
+```
+NUMINFO_PROVIDER_URL = https://provider.example/api/hlr
+NUMINFO_PROVIDER_KEY = aapki key
+```
+Isse **operator / circle / number type / MNP ported** live aata hai.
+⚠️ Leaked personal records (naam-pata wala data) **jaan-boojh kar support nahi** —
+wo illegal hai aur bot ban ho jata hai.
+
+### Status check
+```
+GET /health   →  "providers": {"vehicle": "on/off", "carrier": "on/off"}
+```
+
+---
+
 ## 🗄️ Database
 
 - **SQLite** — apna data (records, keys, orders, logs) dashboard se add karo, coding ki zaroorat nahi.

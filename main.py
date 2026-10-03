@@ -1954,6 +1954,256 @@ async def native_snap_highlights(params: Dict[str, Any], request: Request) -> Tu
 NATIVE_FUNCS_PATCHED = True
 
 
+# =====================================================================
+# v2.6: AUTHORIZED PROVIDER WIRING (vehicle + carrier lookup)
+# ---------------------------------------------------------------------
+# Aapki apni licensed API lagane ka system. Render -> Environment me daalo:
+#
+#   VEHICLE_PROVIDER_URL   = https://provider.example/api/vehicle
+#   VEHICLE_PROVIDER_KEY   = aapki key
+#   VEHICLE_PROVIDER_PARAM = number        (query param ka naam; default "number")
+#   VEHICLE_PROVIDER_HEADER= Authorization (header ka naam; default "Authorization")
+#   VEHICLE_PROVIDER_AUTH  = bearer | key | header   (key kaise bhejna hai)
+#
+#   NUMINFO_PROVIDER_URL   = https://provider.example/api/hlr   (legal carrier lookup)
+#   NUMINFO_PROVIDER_KEY   = aapki key
+#   NUMINFO_PROVIDER_PARAM = number
+#
+# Provider set hone par endpoints khud live ho jate hain. Set na ho to saaf
+# Hinglish message + official links (jhoothe data kabhi nahi).
+# =====================================================================
+def vehicle_provider() -> Dict[str, str]:
+    return {
+        "url": (os.environ.get("VEHICLE_PROVIDER_URL") or "").strip(),
+        "key": (os.environ.get("VEHICLE_PROVIDER_KEY") or "").strip(),
+        "param": (os.environ.get("VEHICLE_PROVIDER_PARAM") or "number").strip() or "number",
+        "header": (os.environ.get("VEHICLE_PROVIDER_HEADER") or "Authorization").strip() or "Authorization",
+        "auth": (os.environ.get("VEHICLE_PROVIDER_AUTH") or "bearer").strip().lower(),
+    }
+
+
+def numinfo_provider() -> Dict[str, str]:
+    return {
+        "url": (os.environ.get("NUMINFO_PROVIDER_URL") or "").strip(),
+        "key": (os.environ.get("NUMINFO_PROVIDER_KEY") or "").strip(),
+        "param": (os.environ.get("NUMINFO_PROVIDER_PARAM") or "number").strip() or "number",
+        "header": (os.environ.get("NUMINFO_PROVIDER_HEADER") or "Authorization").strip() or "Authorization",
+        "auth": (os.environ.get("NUMINFO_PROVIDER_AUTH") or "bearer").strip().lower(),
+    }
+
+
+def _provider_headers(cfg: Dict[str, str]) -> Dict[str, str]:
+    key = cfg.get("key") or ""
+    if not key:
+        return {}
+    auth = cfg.get("auth") or "bearer"
+    if auth == "bearer":
+        return {cfg["header"]: f"Bearer {key}"}
+    if auth == "key":
+        return {cfg["header"]: key, "X-API-Key": key}
+    if auth == "header":
+        return {cfg["header"]: key}
+    return {}
+
+
+
+def _dig(data: Any, *names, default=None):
+    """Nested/naam badalne wale keys se value nikalo (case + _ - ignore)."""
+    want = [str(n).lower().replace("_", "").replace("-", "").replace(" ", "") for n in names]
+    stack = [data]
+    seen = 0
+    while stack and seen < 400:
+        cur = stack.pop(0)
+        seen += 1
+        if isinstance(cur, dict):
+            for k, v in cur.items():
+                kk = str(k).lower().replace("_", "").replace("-", "").replace(" ", "")
+                if kk in want and v not in (None, "", [], {}):
+                    return v
+            for v in cur.values():
+                if isinstance(v, (dict, list)):
+                    stack.append(v)
+        elif isinstance(cur, list):
+            for v in cur[:12]:
+                if isinstance(v, (dict, list)):
+                    stack.append(v)
+    return default
+
+
+def _first(*vals):
+    for v in vals:
+        if v not in (None, "", [], {}, "N/A", "null", "NA"):
+            return v
+    return ""
+
+
+_MAP_VEHICLE_KEYS = (
+    ("plate", ("registrationnumber", "regnumber", "regno", "vehicle_number", "vehiclenumber", "reg_no", "number", "rc_number", "regn_no")),
+    ("maker", ("maker", "makerdesc", "make", "manufacturer", "mfr", "maker_description", "maker_name")),
+    ("model", ("model", "modeldesc", "vehicle_model", "model_name", "maker_model")),
+    ("vehicle_class", ("vehicleclass", "vehicle_class_desc", "class", "vc", "vehicle_category", "vehicle_type")),
+    ("fuel", ("fuel", "fueldesc", "fuel_type", "fuel_desc")),
+    ("cc", ("cc", "cubiccapacity", "engine_capacity", "enginecc", "cubic_capacity")),
+    ("seating", ("seatingcapacity", "seating_capacity", "seats", "seating")),
+    ("colour", ("color", "colour", "vehiclecolor", "vehicle_color")),
+    ("emission", ("emissionnorm", "emission_norms", "emission", "norms", "norms_desc")),
+    ("mfg_year", ("manufacturingyear", "mfg_year", "manufacture_year", "year_of_manufacture", "mfgdate", "manufacturing_date")),
+    ("reg_date", ("registrationdate", "reg_date", "first_reg_date", "registration_date", "regd_date")),
+    ("fitness_upto", ("fitnesstodate", "fitness_upto", "fitness_upto_date", "fitnessvalidupto", "fit_upto")),
+    ("tax_upto", ("taxtodate", "tax_upto", "tax_upto_date", "taxvalidupto")),
+    ("tax_paid", ("taxpaidupto", "tax_paid")),
+    ("insurance_company", ("insurancecompany", "ins_company", "insurance_company_name", "insurancecompanyname", "insurer", "insurance")),
+    ("insurance_upto", ("insuranceupto", "ins_upto", "insurance_upto", "insurancevalidupto", "insurance_valid_upto", "insurancevalidity")),
+    ("puc_upto", ("pucupto", "puc_upto", "pucc_upto", "pollutioncertificateupto", "puc_valid_upto", "pucvalidupto")),
+    ("owner", ("ownername", "owner_name", "owner", "registered_owner", "registeredowner", "owner_full_name")),
+    ("owner_serial", ("ownerserial", "owner_sr", "owner_serial_no", "owner_serial_number")),
+    ("mobile", ("mobile", "mobilenumber", "owner_mobile", "mobile_number", "phonenumber", "contact")),
+    ("address", ("address", "presentaddress", "owner_address", "permanent_address", "addr")),
+    ("chassis", ("chassis", "chassisnumber", "chassis_no", "chassisnumbermasked", "vin", "vin_number")),
+    ("engine", ("engineno", "engine", "engine_number", "enginenumber", "engine_no")),
+    ("financer", ("financername", "financer", "financer_name", "hypothecation", "loan", "bank_name", "finance_by")),
+    ("rto", ("rto", "rto_name", "rtoname", "rto_code", "registeringauthority", "rto_location")),
+    ("rto_phone", ("rto_phone", "rtophone", "rto_contact", "rto_phone_number")),
+    ("rto_website", ("rto_website", "rtosite", "website")),
+    ("city", ("city", "rto_city", "rto_district", "district")),
+    ("blacklist", ("blacklist", "blacklisted", "is_blacklisted", "blacklist_status")),
+    ("state", ("state", "statename", "state_name")),
+    ("vehicle_age", ("vehicleage", "vehicle_age", "age_of_vehicle")),
+    ("noc", ("noc", "noc_details", "noc_status")),
+)
+
+
+def map_vehicle_payload(raw: Any) -> Dict[str, Any]:
+    """Kisi bhi provider ke JSON ko bot ke samajhne wale shape me badal do."""
+    if not isinstance(raw, dict):
+        return {"rc": {}, "challans": [], "summary": {}, "provider_shape": "non-dict"}
+    rc: Dict[str, Any] = {}
+    for target, names in _MAP_VEHICLE_KEYS:
+        val = _dig(raw, *names)
+        if val not in (None, "", [], {}):
+            rc[target] = val
+    # insurance naming alag rakhna (bot ins_company maangta hai)
+    if rc.get("insurance_company"):
+        rc["ins_company"] = rc.pop("insurance_company")
+    if rc.get("insurance_upto"):
+        rc["ins_upto"] = rc.pop("insurance_upto")
+    if rc.get("mobile"):
+        rc["mob"] = rc.pop("mobile")
+
+    # ---- challans ----
+    if not rc.get("chassis") and rc.get("engine"):
+        rc["chassis"] = ""
+    challan_raw = _dig(raw, "challans", "challandetails", "challan_details", "challan",
+                       "challanlist", "challan_list", "violations", "pendingchallans")
+    challans: List[Dict[str, Any]] = []
+    if isinstance(challan_raw, dict):
+        challan_raw = list(challan_raw.values())
+    if isinstance(challan_raw, list):
+        for c in challan_raw[:20]:
+            if not isinstance(c, dict):
+                continue
+            _no = _first(_dig(c, "challanno", "challan_number", "challannumber", "number", "challan_no", "id"))
+            _acc = _first(_dig(c, "accusedname", "accused", "name", "driver_name"))
+            _amt = _first(_dig(c, "amount", "challanamount", "fine", "penalty", "total_amount"))
+            _dt = _first(_dig(c, "date", "chalandate", "challan_date", "offence_date", "issued_date"))
+            _st = _first(_dig(c, "status", "challanstatus", "challan_status", "payment_status", "state"))
+            _off = _first(_dig(c, "offence", "offence_details", "offensedetails", "violation", "violation_details", "offence_desc"))
+            _pl = _first(_dig(c, "place", "location", "offence_place", "district", "rto"))
+            _cr = _first(_dig(c, "court", "court_name", "concerned_court"))
+            challans.append({
+                "number": _no, "accused": _acc, "amount": _amt, "date": _dt,
+                "status": _st, "offence": _off, "place": _pl, "court": _cr,
+                # aliases — bot ke parser ko seedha mil jaye
+                "challan_number": _no, "challan_no": _no, "challan_id": _no,
+                "challan_amount": _amt, "fine_amount": _amt,
+                "challan_date": _dt, "offence_date": _dt, "issue_date": _dt,
+                "challan_status": _st, "payment_status": _st,
+                "offence_details": _off, "violation": _off,
+                "challan_place": _pl, "offence_place": _pl,
+                "court_name": _cr,
+            })
+    summary_raw = _dig(raw, "challansummary", "challan_summary", "summary", "challanstats")
+    if isinstance(summary_raw, dict):
+        summary = {
+            "count": _first(_dig(summary_raw, "total", "totalchallans", "count", "total_challan"), len(challans)),
+            "pending": _first(_dig(summary_raw, "pending", "pendingchallans", "unpaid"), 0),
+            "paid": _first(_dig(summary_raw, "paid", "paidchallans", "disposed"), 0),
+            "total_amount": _first(_dig(summary_raw, "totalamount", "total_amount", "amount"), 0),
+            "pending_amount": _first(_dig(summary_raw, "pendingamount", "pending_amount"), 0),
+        }
+    else:
+        summary = {"count": len(challans)} if challans else {}
+
+    return {"rc": rc, "challans": challans, "summary": summary}
+
+
+def _ch(challans: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Bot ke parser ko challan_details chahiye (upstream jaisa naam)."""
+    return {"challan_details": challans}
+
+
+def bot_sections(rc: Dict[str, Any], summary: Dict[str, Any]) -> Dict[str, Any]:
+    """Bot ke parser ke liye exact shape (sections.*) — provider ka koi bhi key ho."""
+    veh = {
+        "Model Name": _first(rc.get("maker")), "Maker Model": _first(rc.get("model")),
+        "Vehicle Class": _first(rc.get("vehicle_class")), "Fuel Type": _first(rc.get("fuel")),
+        "Cubic Capacity": _first(rc.get("cc")), "Chassis Number": _first(rc.get("chassis")),
+        "Engine Number": _first(rc.get("engine")), "Fuel Norms": _first(rc.get("emission")),
+    }
+    own = {
+        "Owner Name": _first(rc.get("owner")), "Owner Serial No": _first(rc.get("owner_serial")),
+        "Registered RTO": _first(rc.get("rto")), "Registration Number": _first(rc.get("plate")),
+    }
+    dates = {
+        "Registration Date": _first(rc.get("reg_date")), "Fitness Upto": _first(rc.get("fitness_upto")),
+        "Tax Upto": _first(rc.get("tax_upto")), "Vehicle Age": _first(rc.get("vehicle_age")),
+        "PUC No": _first(rc.get("puc_no")), "PUC Upto": _first(rc.get("puc_upto")),
+    }
+    ins = {
+        "Insurance Company": _first(rc.get("ins_company")), "Insurance No": _first(rc.get("ins_no")),
+        "Insurance Upto": _first(rc.get("ins_upto")), "Insurance Status": _first(rc.get("ins_status")),
+    }
+    other = {
+        "Seating Capacity": _first(rc.get("seating")), "Blacklist Status": _first(rc.get("blacklist")),
+        "Financer Name": _first(rc.get("financer")), "NOC Details": _first(rc.get("noc")),
+        "Permit Type": _first(rc.get("permit")), "Colour": _first(rc.get("colour")),
+    }
+    info = {
+        "vehicle_number": _first(rc.get("plate")), "rto": _first(rc.get("rto")),
+        "city_name": _first(rc.get("city")), "phone": _first(rc.get("rto_phone")),
+        "website": _first(rc.get("rto_website")), "address": _first(rc.get("address")),
+        "state": _first(rc.get("state")), "mob": _first(rc.get("mob")),
+    }
+    return {
+        "vehicle_info": {k: v for k, v in info.items() if v},
+        "sections": {
+            "vehicle_details": {k: v for k, v in veh.items() if v},
+            "ownership_details": {k: v for k, v in own.items() if v},
+            "important_dates": {k: v for k, v in dates.items() if v},
+            "insurance_information": {k: v for k, v in ins.items() if v},
+            "other_information": {k: v for k, v in other.items() if v},
+        },
+        "challan_summary": summary,
+    }
+
+
+async def call_provider(cfg: Dict[str, str], number: str, timeout: float = 25.0) -> Any:
+    """Provider API ko call karo — auth style ke saath."""
+    import httpx
+    params = {cfg["param"]: number}
+    if cfg.get("key") and (cfg.get("auth") or "") == "query":
+        params["key"] = cfg["key"]
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True,
+                                 headers={"User-Agent": UA}) as client:
+        r = await client.get(cfg["url"], params=params, headers=_provider_headers(cfg))
+        if r.status_code == 200:
+            try:
+                return r.json()
+            except Exception:                                    # noqa: BLE001
+                return {"raw_text": r.text[:2000]}
+        raise RuntimeError(f"provider HTTP {r.status_code}")
+
+
 def native_vehicle(kind: str):
     """Factory: returns the native handler for a vehicle endpoint."""
     async def _inner(params: Dict[str, Any], request: Request) -> Tuple[Optional[Dict], bool]:
@@ -1961,11 +2211,39 @@ def native_vehicle(kind: str):
                   or params.get("vehicle") or params.get("q") or "").strip()
         if not number:
             return None, True
+        cfg = vehicle_provider()
+        if cfg.get("url"):
+            try:
+                raw = await call_provider(cfg, number)
+                mapped = map_vehicle_payload(raw)
+                if mapped["rc"] or mapped["challans"]:
+                    out = {
+                        "success": True, "plate": number, "endpoint": kind,
+                        "rc": mapped["rc"], "challans": mapped["challans"],
+                        "summary": mapped["summary"],
+                        "source": "authorized provider", "provider": cfg["url"],
+                        # bot ke parser ke liye exact shape (sections.*) + challans
+                        "data": dict(bot_sections(mapped["rc"], mapped["summary"]), **_ch(
+                            mapped["challans"])),
+                    }
+                    return out, True
+                # provider ne khaali diya — local analysis + saaf note
+                parsed = parse_vehicle(number)
+                parsed.update({"success": True, "endpoint": kind, "local_analysis": True,
+                               "provider_note": "Provider ne is number par koi record nahi diya.",
+                               "provider_shape": sorted(raw.keys())[:15] if isinstance(raw, dict) else str(type(raw))})
+                return parsed, True
+            except Exception as e:                                # noqa: BLE001
+                parsed = parse_vehicle(number)
+                parsed.update({"success": True, "endpoint": kind, "local_analysis": True,
+                               "provider_error": str(e)[:160]})
+                return parsed, True
         parsed = parse_vehicle(number)
         parsed["endpoint"] = kind
         parsed["local_analysis"] = True
+        parsed["provider_needed"] = True
         if kind.startswith("challan"):
-            parsed["challan_data"] = "Live challan data requires upstream (Parivahan) or custom database records"
+            parsed["challan_data"] = "Live challan data ke liye authorized provider key chahiye (VEHICLE_PROVIDER_URL)"
         return parsed, True
 
     return _inner
@@ -2068,10 +2346,35 @@ def phone_analysis(number: str) -> Dict[str, Any]:
 
 
 async def native_num_info(params: Dict[str, Any], request: Request) -> Tuple[Optional[Dict], bool]:
+    """Number ka LEGAL carrier data: operator, circle, type.
+
+    Provider (NUMINFO_PROVIDER_URL) set ho to live HLR/carrier lookup se aata hai.
+    Leaked personal records yahan jaan-boojh kar nahi dikhaye jate (illegal hai).
+    """
     q = (params.get("q") or params.get("number") or params.get("phone") or params.get("num") or "").strip()
     if not q:
         return None, True
-    return phone_analysis(q), True
+    out = phone_analysis(q)
+    cfg = numinfo_provider()
+    if not cfg.get("url"):
+        out["provider_needed"] = True
+        out["how_to_setup"] = ["NUMINFO_PROVIDER_URL=<carrier/HLR lookup endpoint>",
+                               "NUMINFO_PROVIDER_KEY=<your key>"]
+        return out, True
+    try:
+        raw = await call_provider(cfg, re.sub(r"[^0-9+]", "", q), timeout=20)
+        if isinstance(raw, dict):
+            out["carrier"] = {
+                "operator": _first(_dig(raw, "operator", "carrier", "network", "operatorname", "sp")),
+                "circle": _first(_dig(raw, "circle", "region", "state", "zone", "circle_name")),
+                "type": _first(_dig(raw, "type", "numbertype", "line_type", "connection", "mobile_type")),
+                "ported": _first(_dig(raw, "ported", "mnp", "is_ported", "portability")),
+            }
+            out["source"] = "authorized provider (HLR / carrier lookup)"
+            out["provider"] = cfg["url"]
+    except Exception as e:                                        # noqa: BLE001
+        out["provider_error"] = str(e)[:140]
+    return out, True
 
 
 async def native_leak(params: Dict[str, Any], request: Request) -> Tuple[Optional[Dict], bool]:
@@ -5175,13 +5478,20 @@ async def run_endpoint(request: Request, ep: Dict[str, Any],
                        extra_params: Optional[Dict[str, Any]] = None) -> JSONResponse:
     started = time.time()
     path = ep.get("path", "")
-    if path in PRIVACY_DISABLED_ENDPOINTS:
+    # v2.6: aapka authorized provider laga ho to ye endpoints live ho jate hain
+    _vehicle_paths = path.startswith("vehicle-") or path in {"vehicle-report", "vehicle-full", "rc-info"}
+    _numinfo_paths = path in {"num-info", "number-info", "num"}
+    _provider_live = bool(vehicle_provider().get("url")) if _vehicle_paths else (
+        bool(numinfo_provider().get("url")) if _numinfo_paths else False)
+
+    if path in PRIVACY_DISABLED_ENDPOINTS and not _provider_live:
         key = request.query_params.get("key", DEMO_KEY)
         ok, _key_used, key_error = validate_key(key)
         if not ok:
             return JSONResponse(error_payload(ep, key_error), status_code=401)
         if path.startswith("vehicle-") or path in {"vehicle-report", "vehicle-full", "rc-info"}:
-            message = "Live vehicle/owner/challan lookup disabled hai jab tak authorized provider configure na ho. Official Parivahan/e-Challan portal use karein."
+            message = ("Live vehicle/owner/challan lookup disabled hai jab tak authorized provider configure na ho. "
+                       "Apni licensed API lagao: VEHICLE_PROVIDER_URL + VEHICLE_PROVIDER_KEY (Render env).")
             links = {
                 "vahan": "https://vahan.parivahan.gov.in/nrservices/faces/user/searchstatus.xhtml",
                 "echallan": "https://echallan.parivahan.gov.in/index/accused-challan",
@@ -6594,8 +6904,14 @@ async def _startup_tac_index():
 
 @app.get("/health")
 async def health():
+    _vp = vehicle_provider()
+    _np = numinfo_provider()
     return {"status": "ok", "time_ist": now_ist(), "version": APP_VERSION,
             "endpoints": len(ENDPOINTS), "database": os.path.abspath(DB_PATH),
+            "providers": {
+                "vehicle": "on" if _vp.get("url") else "off (VEHICLE_PROVIDER_URL set karo)",
+                "carrier": "on" if _np.get("url") else "off (NUMINFO_PROVIDER_URL set karo)",
+            },
             "developer": brand(), "powered_by": brand_line()}
 
 
