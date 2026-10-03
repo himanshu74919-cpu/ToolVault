@@ -42,7 +42,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 # =====================================================================
 # CONFIGURATION  (everything can be changed from the dashboard too)
 # =====================================================================
-APP_VERSION = "2.5.1"
+APP_VERSION = "2.5.11"
 DB_PATH = os.environ.get("DB_PATH", "osint_database.db")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -1052,6 +1052,78 @@ def _nr_slug(name: str) -> str:
     return t
 
 
+SPECS_SEED_PATH = os.path.join(DATA_DIR, "specs_seed.json")
+_SPECS_SEED: Dict[str, Any] = {"loaded": False, "items": {}}
+_SEED_STOP = {"the", "5g", "4g", "lte", "ds", "dual", "mobile", "wifi", "cellular"}
+_SEED_MODS = {"fe", "mini", "pro", "ultra", "max", "plus", "se", "lite"}   # ye shabd device ki pehchaan hain
+
+
+def _load_specs_seed() -> Dict[str, Any]:
+    """Seed file ek hi baar load karo (popular devices ki ready-made specs)."""
+    if _SPECS_SEED["loaded"]:
+        return _SPECS_SEED["items"]
+    _SPECS_SEED["loaded"] = True
+    try:
+        with open(SPECS_SEED_PATH, encoding="utf-8") as f:
+            items = json.load(f)
+        if isinstance(items, dict):
+            _SPECS_SEED["items"] = items
+    except Exception:  # noqa: BLE001
+        pass
+    return _SPECS_SEED["items"]
+
+
+def _seed_tokens(name: str) -> set:
+    n = re.sub(r"\+", " plus ", str(name or "").lower())
+    return {w for w in re.split(r"[^a-z0-9]+", n) if w and w not in _SEED_STOP}
+
+
+def _seed_lookup(model: str, brand: str = "") -> Optional[Dict[str, Any]]:
+    """Seed me device dhoondo: exact slug → brand+slug → token match (safe)."""
+    items = _load_specs_seed()
+    if not items:
+        return None
+    for cand in (model, f"{brand} {model}" if brand else "", f"{model} {brand}" if brand else ""):
+        c = re.sub(r"\s+", " ", str(cand or "")).strip()
+        if len(c) < 3:
+            continue
+        hit = items.get(_nr_slug(c)[:90])
+        if isinstance(hit, dict) and hit.get("sections"):
+            return hit
+    want = _seed_tokens(model)
+    if not want:
+        return None
+    # v2.5.9: smart match — TAC naam ("APPLE IPHONE 12 MINI") bhi kaam kare.
+    # Rules: modifier tokens (fe/pro/ultra/mini/plus/max) BOTH taraf barabar hone chahiye,
+    # number token (12, a54, s23) match zaroori, aur kam se kam 2 token common.
+    want_mods = {t for t in want if t in _SEED_MODS}
+    want_nums = {t for t in want if any(ch.isdigit() for ch in t)}
+    min_shared = 1 if len(want) <= 1 else 2
+    best: Optional[Dict[str, Any]] = None
+    best_score = 0
+    for _k, v in items.items():
+        if not isinstance(v, dict) or not v.get("sections"):
+            continue
+        got = _seed_tokens(v.get("requested") or v.get("name") or "")
+        got_all = got | _seed_tokens(v.get("name") or "")
+        if not got_all:
+            continue
+        got_mods = {t for t in got_all if t in _SEED_MODS}
+        if got_mods != want_mods:
+            continue                                  # s22 vs s22 ultra / a9 vs a9+ / pad vs pad se
+        if not want.issubset(got_all):
+            continue                                  # spark 20 vs camon 20 — series word match zaroori
+        if want_nums and not (want_nums & got_all):
+            continue                                  # 12 mini vs 13 mini safe
+        shared = len(want & got_all)
+        if shared < min_shared:
+            continue
+        score = shared * 10 - len(got_all - want)
+        if score > best_score:
+            best, best_score = v, score
+    return best
+
+
 async def _device_specs_fetch(model: str, brand: str = "") -> Optional[Dict[str, Any]]:
     """nanoreview.net se device page → photo + spec sections (tables)."""
     model = re.sub(r"\s+", " ", str(model or "")).strip()
@@ -1062,6 +1134,16 @@ async def _device_specs_fetch(model: str, brand: str = "") -> Optional[Dict[str,
     if hit and (time.time() - hit[0]) < 86400:
         return hit[1]
 
+    # 0) SEED — popular devices ki ready-made specs (cloud IP block se farq nahi padta)
+    seeded = _seed_lookup(model, brand)
+    if seeded:
+        out_seed = dict(seeded)
+        out_seed.setdefault("source", "nanoreview.net (seed)")
+        if out_seed.get("sections"):
+            out_seed["success"] = True
+            _NR_CACHE[key] = (time.time(), out_seed)
+            return out_seed
+
     import httpx
     slug = _nr_slug(model)
     if brand and not slug.startswith(_nr_slug(brand)):
@@ -1070,30 +1152,223 @@ async def _device_specs_fetch(model: str, brand: str = "") -> Optional[Dict[str,
     html = ""
     used_url = ""
     headers = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9", "Accept": "text/html,*/*"}
-    try:
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers=headers) as client:
-            for u in urls:
+    _PROXIES = (
+        ("https://api.allorigins.win/raw?url=", "raw"),
+        ("https://api.allorigins.win/get?url=", "get"),
+        ("https://api.codetabs.com/v1/proxy?quest=", "quest"),
+    )
+    proxied = False
+
+    def _unwrap(txt: str) -> str:
+        """allorigins /get → {"contents": "<html>…"} ko kholo."""
+        t = txt.lstrip()
+        if t.startswith("{"):
+            try:
+                return str(json.loads(t).get("contents") or "")
+            except Exception:  # noqa: BLE001
+                return ""
+        return txt
+
+    async def _fetch_one(client, url: str) -> str:
+        try:
+            r = await client.get(url)
+            if r.status_code != 200:
+                return ""
+            t = _unwrap(r.text)
+            return t if ("specs-table" in t) else ""
+        except Exception:  # noqa: BLE001
+            return ""
+
+    async def _wayback(client, target: str) -> str:
+        """archive.org ka raw snapshot (id_) — datacenter IP par bhi chalta hai."""
+        try:
+            av = await client.get("http://archive.org/wayback/available",
+                                  params={"url": target.replace("https://", "")})
+            snap = ((av.json().get("archived_snapshots") or {}).get("closest") or {})
+            ts = snap.get("timestamp")
+            if not ts:
+                return ""
+            r = await client.get(f"https://web.archive.org/web/{ts}id_/{target}")
+            if r.status_code == 200 and "specs-table" in r.text:
+                return r.text
+        except Exception:  # noqa: BLE001
+            return ""
+        return ""
+
+    async def _fetch_best(client, budget: float = 20.0):
+        """Saare routes PARALLEL — jo pehle mile (best priority) wahi use karo. Cloud block ka ilaaj."""
+        nonlocal proxied
+        tasks: Dict[Any, Any] = {}
+        for u in urls:
+            q = urllib.parse.quote(u, safe="")
+            for pr, cand in ((0, u), (1, _PROXIES[0][0] + q), (2, _PROXIES[2][0] + q),
+                             (3, _PROXIES[1][0] + q)):
+                tasks[asyncio.create_task(_fetch_one(client, cand))] = (pr, u)
+        tasks[asyncio.create_task(_wayback(client, urls[0]))] = (1, urls[0])
+        deadline = time.monotonic() + budget
+        best = None
+        first_hit_at = 0.0
+        pending = set(tasks)
+        while pending:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                break
+            done, pending = await asyncio.wait(pending, timeout=min(rem, 3.0),
+                                               return_when=asyncio.FIRST_COMPLETED)
+            for d in done:
+                pr, u = tasks.get(d, (9, ""))
                 try:
-                    r = await client.get(u)
-                    if r.status_code == 200 and "specs-table" in r.text:
-                        html, used_url = r.text, u
-                        break
+                    txt = d.result()
                 except Exception:  # noqa: BLE001
+                    txt = ""
+                if not txt:
                     continue
-            if not html:
-                # DuckDuckGo se sahi nanoreview URL dhoondo
+                if pr == 0:
+                    for p in pending:
+                        p.cancel()
+                    return txt, u
+                if best is None or pr < best[0]:
+                    best = (pr, u, txt)
+                first_hit_at = first_hit_at or time.monotonic()
+            if best and (time.monotonic() - first_hit_at) > 2.5:
+                break          # direct ka 2.5s intezaar khatam — proxy ka jawab le lo
+        for p in pending:
+            p.cancel()
+        if best:
+            proxied = True
+            return best[2], best[1]
+        return "", ""
+
+    async def _ddg_links(client, query: str) -> List[str]:
+        """Search se nanoreview URLs: html.ddg / lite.ddg / allorigins — sab parallel."""
+        enc = urllib.parse.quote_plus(query)
+        sources = [
+            ("https://html.duckduckgo.com/html/", {"q": query}),
+            ("https://lite.duckduckgo.com/lite/", {"q": query}),
+            (f"{_PROXIES[0][0]}{urllib.parse.quote('https://html.duckduckgo.com/html/?q=' + enc, safe='')}", None),
+        ]
+
+        async def _one(u, p):
+            try:
+                r = await client.get(u, params=p) if p is not None else await client.get(u)
+                body = _unwrap(r.text)
+                if not body:
+                    return []
+                out = []
+                for m in re.finditer(r"uddg=([^&\"]+)", body):
+                    cand = urllib.parse.unquote(m.group(1))
+                    if "nanoreview.net" in cand and "/en/" in cand:
+                        out.append(cand)
+                for m in re.finditer(r"https?://nanoreview\.net/en/[A-Za-z0-9%._/-]{5,120}", body):
+                    out.append(m.group(0))
+                return out
+            except Exception:  # noqa: BLE001
+                return []
+
+        tset = [asyncio.create_task(_one(u, p)) for u, p in sources]
+        try:
+            done, pend = await asyncio.wait(tset, timeout=9.0, return_when=asyncio.FIRST_COMPLETED)
+            for d in done:
                 try:
-                    d = await client.get("https://html.duckduckgo.com/html/",
-                                         params={"q": f"site:nanoreview.net {model}"})
-                    for m in re.finditer(r"uddg=([^&\"]+)", d.text):
-                        cand = urllib.parse.unquote(m.group(1))
-                        if "nanoreview.net" in cand and "/en/" in cand:
-                            rr = await client.get(cand)
-                            if rr.status_code == 200 and "specs-table" in rr.text:
-                                html, used_url = rr.text, cand
-                                break
+                    res = d.result()
                 except Exception:  # noqa: BLE001
-                    pass
+                    res = []
+                if res:
+                    for p in pend:
+                        p.cancel()
+                    return res
+        finally:
+            for t in tset:
+                if not t.done():
+                    t.cancel()
+        return []
+
+    # v2.5.6: slug variants — real sites par kai models suffix/brand-less slug par hote hain
+    brand_slug = _nr_slug(brand) if brand else ""
+    variants: List[str] = []
+    for base in ([slug, f"{brand_slug}-{slug}"] if brand_slug and not slug.startswith(brand_slug) else [slug]):
+        for sfx in ("", "-5g", "-4g", "-lte"):
+            v = base + sfx
+            if v not in variants:
+                variants.append(v)
+    if brand_slug and slug.startswith(brand_slug + "-"):
+        short = slug[len(brand_slug) + 1:]
+        for sfx in ("", "-5g", "-4g"):
+            v = short + sfx
+            if v not in variants:
+                variants.append(v[:90])
+    variant_urls = [f"https://nanoreview.net/en/{kind}/{v}" for v in variants[:10]
+                    for kind in ("tablet", "phone")]
+
+    def _page_name(h: str) -> str:
+        h1 = re.search(r"<h1[^>]*>(.*?)</h1>", h, re.S)
+        if h1:
+            return _clean_html(h1.group(1))
+        ti = re.search(r"<title>(.*?)</title>", h, re.S)
+        return _clean_html(ti.group(1)).split(":")[0] if ti else ""
+
+    want_tokens = {w for w in re.split(r"[^a-z0-9]+", re.sub(r"\+", " plus ", model.lower()))
+                   if w and w not in _SEED_STOP}
+    want_nums = {t for t in want_tokens if any(ch.isdigit() for ch in t)}
+
+    want_mods = {t for t in want_tokens if t in _SEED_MODS}
+
+    def _name_ok(h: str) -> bool:
+        """Sahi device hai? Number-token (a54, s23, 13) + modifier (fe, pro, mini…) match zaroori."""
+        nm = _page_name(h).lower()
+        if not nm:
+            return True                      # naam nahi mila → rok nahi lagayenge
+        got = {w for w in re.split(r"[^a-z0-9]+", re.sub(r"\+", " plus ", nm)) if w}
+        if want_nums and not (want_nums & got):
+            return False                     # jaise narzo 60 vs narzo 90 — reject
+        if want_mods and not want_mods.issubset(got):
+            return False                     # jaise "s23 fe" vs simple "s23" — reject
+        return True
+
+    try:
+        async with httpx.AsyncClient(timeout=12, follow_redirects=True, headers=headers) as client:
+            html, used_url = await _fetch_best(client, budget=14.0)
+            if html and not _name_ok(html):
+                html, used_url = "", ""      # galat device — variants/DDG try karo
+            if not html and variant_urls:
+                # variant pass — parallel; deadline tak har result check karo (v2.5.7 bug fix:
+                # pehle FIRST_COMPLETED ek hi baar chalta tha aur baaki saare tasks cancel ho jate the)
+                vtasks = {asyncio.create_task(_fetch_one(client, vu)): vu for vu in variant_urls}
+                try:
+                    vdeadline = time.monotonic() + 12.0
+                    vpending = set(vtasks)
+                    while vpending and time.monotonic() < vdeadline:
+                        vdone, vpending = await asyncio.wait(
+                            vpending, timeout=min(3.0, max(0.5, vdeadline - time.monotonic())),
+                            return_when=asyncio.FIRST_COMPLETED)
+                        for d in vdone:
+                            vu = vtasks.get(d, "")
+                            try:
+                                h2 = d.result()
+                            except Exception:  # noqa: BLE001
+                                h2 = ""
+                            if not h2:
+                                continue
+                            got_tokens = {w for w in re.split(
+                                r"[^a-z0-9]+", re.sub(r"\+", " plus ", _page_name(h2).lower())) if w}
+                            if want_tokens and not want_tokens.issubset(got_tokens):
+                                continue          # galat device — chhodo
+                            html, used_url = h2, vu
+                            proxied = True
+                            break
+                        if html:
+                            break
+                finally:
+                    for t in vtasks:
+                        if not t.done():
+                            t.cancel()
+            if not html:
+                for cand in (await _ddg_links(client, f"site:nanoreview.net {model}"))[:4]:
+                    h2 = await _fetch_one(client, cand) or await _wayback(client, cand)
+                    if h2 and _name_ok(h2):
+                        html, used_url = h2, cand
+                        proxied = True
+                        break
     except Exception:  # noqa: BLE001
         return None
     if not html:
@@ -1156,7 +1431,7 @@ async def _device_specs_fetch(model: str, brand: str = "") -> Optional[Dict[str,
         "image": image,
         "sections": sections,
         "row_count": sum(len(x["rows"]) for x in sections),
-        "source": "nanoreview.net",
+        "source": "nanoreview.net" + (" (proxy)" if proxied else ""),
     }
     if out["success"]:
         _NR_CACHE[key] = (time.time(), out)
