@@ -43,7 +43,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 # =====================================================================
 # CONFIGURATION  (everything can be changed from the dashboard too)
 # =====================================================================
-APP_VERSION = "2.6.8"
+APP_VERSION = "2.6.9"
 DB_PATH = os.environ.get("DB_PATH", "osint_database.db")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -169,6 +169,15 @@ def _auto_backup_loop():
             backup_db_to_github("auto")
         except Exception:
             pass
+
+
+def _upstream_key_effective() -> str:
+    return (get_setting("upstream_key", DEFAULT_UPSTREAM_KEY) or DEFAULT_UPSTREAM_KEY).strip()
+
+
+def upstream_key_is_placeholder() -> bool:
+    """Demo/khali key = upstream kaam nahi karega (waste call se bacho)."""
+    return _upstream_key_effective() in ("", "Demo", "demo", "KEY")
 
 
 if BACKUP_REPO and BACKUP_TOKEN and os.environ.get("GITHUB_BACKUP_RESTORE", "1") != "0":
@@ -575,13 +584,20 @@ def upstream_key_status() -> Dict[str, Any]:
         "cooldown_left_sec": max(0, int(float(os.environ.get("UPSTREAM_BAD_COOLDOWN", "900")) - age)) if bad else 0,
         "note": ("Upstream key INVALID hai — Render -> Environment me SETTING_UPSTREAM_KEY=apni-asli-key "
                  "lagao (ya dashboard Settings me). Tab tak hub native data se kaam kar raha hai.")
-                if bad else "ok / unknown",
+                if (bad and not upstream_key_is_placeholder()) else
+                ("key nahi lagi/placeholder — upstream skip ho raha hai (native data use hota hai)"
+                 if upstream_key_is_placeholder() else "ok / unknown"),
     }
 
 
 def upstream_available() -> bool:
-    """False = key invalid hai aur cooldown chal raha hai (upstream call skip karo)."""
+    """False = upstream call skip karo (key nahi lagi / invalid / cooldown)."""
     if get_setting("upstream_enabled", "1") != "1":
+        return False
+    if upstream_key_is_placeholder():
+        _UPSTREAM_STATE.update({"key_ok": False,
+                                "error": "upstream key configured nahi hai (Demo placeholder)",
+                                "checked_at": time.time()})
         return False
     if _UPSTREAM_STATE.get("key_ok") is not False:
         return True
@@ -7232,7 +7248,10 @@ def _action_list() -> List[str]:
         todo.append("GITHUB_BACKUP_REPO + GITHUB_BACKUP_TOKEN lagao — keys/records ka backup chalu ho jayega")
     if get_setting("admin_password", ADMIN_PASSWORD) == "admin123":
         todo.append("ADMIN_PASSWORD env lagao — dashboard default password se badal do (security)")
-    if _UPSTREAM_STATE.get("key_ok") is False:
+    if upstream_key_is_placeholder():
+        todo.append("UPSTREAM_KEY lagao (agar aapke paas valid key hai) — tab GST/PAN ka live company "
+                    "data aayega; abhi offline parsing chal raha hai (GSTIN valid/state/PAN type sab milta hai)")
+    elif _UPSTREAM_STATE.get("key_ok") is False:
         todo.append("SETTING_UPSTREAM_KEY lagao — abhi upstream key invalid hai (GST/PAN live data nahi)")
     if not vehicle_provider().get("url"):
         todo.append("VEHICLE_PROVIDER_URL + KEY lagao — vehicle/challan live data chalu ho jayega")
