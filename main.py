@@ -43,7 +43,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 # =====================================================================
 # CONFIGURATION  (everything can be changed from the dashboard too)
 # =====================================================================
-APP_VERSION = "2.8.2"
+APP_VERSION = "2.8.3"
 DB_PATH = os.environ.get("DB_PATH", "osint_database.db")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -82,9 +82,11 @@ _KEEPALIVE_STATE: Dict[str, Any] = {"last_run": None, "last_ok": None, "runs": 0
 
 
 def keepalive_loop():
-    """Har ~9 min me peers ko ping karo (Render 15 min inactivity par sula deta hai)."""
+    """Pehli ping 90 sec me, phir har ~9 min (Render 15 min inactivity par sula deta hai)."""
+    _first = True
     while True:
-        time.sleep(max(120.0, KEEPALIVE_MINUTES * 60))
+        time.sleep(90.0 if _first else max(120.0, KEEPALIVE_MINUTES * 60))
+        _first = False
         for url in list(KEEPALIVE_PEERS):
             try:
                 r = httpx.get(url, timeout=90, follow_redirects=True)
