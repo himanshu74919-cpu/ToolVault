@@ -112,3 +112,31 @@ Dono green hone par hi push karo — `precheck.py` push guard hai.
 - IMEI privacy: response me IMEI ke sirf **pehle 8 digit** dikhte hain, poora number nahi.
 - Jin endpoints par legal/policy rok hai (vehicle, leaked records, aadhaar, email) wo **jaan-boojh kar disabled** hain — 410 + saaf Hinglish message dete hain.
 - Har response me `_meta` aata hai (endpoint, source, server time, version) — debugging aasan.
+
+---
+
+## 💾 PERMANENCE (v2.6) — API keys kabhi na ude
+
+⚠️ **Render free plan par filesystem ephemeral hai** — service restart / spin-down / redeploy
+hote hi `osint_database.db` **ud jati hai**. Isliye banayi gayi keys, records aur settings
+gayab ho jate hain (yehi wajah hai ki key baar-baar "Invalid API key" deti thi).
+
+### Ilaaj — 3 env vars (Render → Environment)
+```
+MASTER_API_KEY        = aapki permanent key (comma se multiple: key1,key2)
+GITHUB_BACKUP_REPO    = owner/repo           # PRIVATE repo, jaise himanshu74919-cpu/hub-db-backup
+GITHUB_BACKUP_TOKEN   = ghp_xxx              # us repo ka token (repo scope)
+GITHUB_BACKUP_MINUTES = 15                   # optional, default 15
+```
+* `MASTER_API_KEY` wali key **DB ke bina bhi** chalti hai — restart par bhi kabhi nahi marte.
+* `GITHUB_BACKUP_REPO` lagane par hub **boot par DB wapas laata hai** aur har 15 min me
+  chupke se backup karta hai → keys, records, settings **sab bach jate hain**.
+* Manual control: `POST /admin/backup/github` (abhi backup) · `POST /admin/restore/github` (wapas lao)
+* Status: `GET /health` → `persistence` block.
+
+### Settings bhi permanent
+`SETTING_<NAAM>` env se koi bhi dashboard setting lock kar sakte ho, jaise:
+```
+SETTING_UPSTREAM_KEY = aapki-asli-upstream-key
+SETTING_DEMO_KEY_ENABLED = 0
+```

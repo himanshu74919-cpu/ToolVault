@@ -35,6 +35,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import httpx
+from pathlib import Path
 from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
@@ -42,7 +43,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 # =====================================================================
 # CONFIGURATION  (everything can be changed from the dashboard too)
 # =====================================================================
-APP_VERSION = "2.5.11"
+APP_VERSION = "2.6.0"
 DB_PATH = os.environ.get("DB_PATH", "osint_database.db")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -52,6 +53,129 @@ DEFAULT_UPSTREAM_KEY = os.environ.get("UPSTREAM_KEY", "Demo")
 DEMO_KEY = os.environ.get("DEMO_KEY", "Demo")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+
+# ---------- v2.6 PERSISTENCE (Render free plan par DB file udd jati hai) ----------
+# MASTER_API_KEY=key1,key2  -> ye keys HAMESHA chalti hain (restart/deploy ke baad bhi)
+MASTER_API_KEYS = [k.strip() for k in (os.environ.get("MASTER_API_KEY") or
+                                       os.environ.get("API_KEYS") or "").replace(";", ",").split(",") if k.strip()]
+# GITHUB_BACKUP_REPO=user/repo (+ token) -> DB apne aap GitHub par backup/restore hogi
+BACKUP_REPO = (os.environ.get("GITHUB_BACKUP_REPO") or "").strip()
+BACKUP_TOKEN = (os.environ.get("GITHUB_BACKUP_TOKEN") or os.environ.get("GITHUB_TOKEN") or "").strip()
+BACKUP_PATH = (os.environ.get("GITHUB_BACKUP_PATH") or "backup/osint_database.db").strip()
+BACKUP_BRANCH = (os.environ.get("GITHUB_BACKUP_BRANCH") or "").strip()
+try:
+    BACKUP_MINUTES = float(os.environ.get("GITHUB_BACKUP_MINUTES") or 15)
+except Exception:
+    BACKUP_MINUTES = 15.0
+_BACKUP_STATE: Dict[str, Any] = {"restored": None, "last_backup": None, "ok": None, "error": None}
+
+# ---------- v2.6 DB ko GitHub se wapas lao (import se pehle, sabse pehle) ----------
+def _gh_headers() -> Dict[str, str]:
+    h = {"Accept": "application/vnd.github.v3.raw", "User-Agent": "osint-hub-persistence"}
+    if BACKUP_TOKEN:
+        h["Authorization"] = f"Bearer {BACKUP_TOKEN}"
+    return h
+
+
+def db_snapshot_bytes() -> bytes:
+    """SQLite ka safe snapshot (WAL ka data bhi shaamil) — temp file ke through."""
+    tmp = DB_PATH + ".snap"
+    src = sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        dst = sqlite3.connect(tmp)
+        try:
+            src.backup(dst)
+            dst.commit()
+        finally:
+            dst.close()
+    finally:
+        src.close()
+    try:
+        data = Path(tmp).read_bytes()
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+    return data
+
+
+def restore_db_from_github() -> Dict[str, Any]:
+    """GitHub par rakhi DB ko wapas lao (boot par). File na ho to chup-chaap skip."""
+    if not (BACKUP_REPO and BACKUP_TOKEN):
+        return {"success": False, "error": "GITHUB_BACKUP_REPO / GITHUB_BACKUP_TOKEN set nahi hai"}
+    url = f"https://api.github.com/repos/{BACKUP_REPO}/contents/{BACKUP_PATH}"
+    params = {"ref": BACKUP_BRANCH} if BACKUP_BRANCH else None
+    try:
+        r = httpx.get(url, headers=_gh_headers(), params=params, timeout=45, follow_redirects=True)
+        if r.status_code == 404:
+            _BACKUP_STATE["restored"] = "no-backup-yet"
+            return {"success": False, "error": "Backup file abhi GitHub par nahi hai (pehli baar chal raha hai)"}
+        r.raise_for_status()
+        if len(r.content) < 512:                       # DB itni chhoti nahi hoti
+            return {"success": False, "error": "Backup file khaali/kharab lag rahi hai"}
+        for ext in ("", "-wal", "-shm"):
+            try:
+                os.remove(DB_PATH + ext)
+            except Exception:
+                pass
+        Path(DB_PATH).write_bytes(r.content)
+        _BACKUP_STATE["restored"] = f"{len(r.content)} bytes"
+        return {"success": True, "restored_bytes": len(r.content), "repo": BACKUP_REPO, "path": BACKUP_PATH}
+    except Exception as e:
+        _BACKUP_STATE["restored"] = f"error: {e}"[:120]
+        return {"success": False, "error": str(e)[:200]}
+
+
+def backup_db_to_github(message: str = "auto backup") -> Dict[str, Any]:
+    """DB ko GitHub par safe karo (har BACKUP_MINUTES minute me apne aap bhi)."""
+    if not (BACKUP_REPO and BACKUP_TOKEN):
+        return {"success": False, "error": "GITHUB_BACKUP_REPO / GITHUB_BACKUP_TOKEN set nahi hai"}
+    api = f"https://api.github.com/repos/{BACKUP_REPO}/contents/{BACKUP_PATH}"
+    hdr = _gh_headers()
+    try:
+        import base64
+        try:
+            data = db_snapshot_bytes()
+        except Exception:
+            data = Path(DB_PATH).read_bytes()
+        sha = None
+        g = httpx.get(api, headers={**hdr, "Accept": "application/vnd.github+json"},
+                      params={"ref": BACKUP_BRANCH} if BACKUP_BRANCH else None, timeout=30)
+        if g.status_code == 200:
+            sha = (g.json() or {}).get("sha")
+        body: Dict[str, Any] = {"message": f"hub db backup: {message}",
+                                "content": base64.b64encode(data).decode(), "committer":
+                                {"name": "osint-api-hub", "email": "hub@users.noreply.github.com"}}
+        if sha:
+            body["sha"] = sha
+        if BACKUP_BRANCH:
+            body["branch"] = BACKUP_BRANCH
+        r = httpx.put(api, headers=hdr, json=body, timeout=60)
+        ok = r.status_code in (200, 201)
+        _BACKUP_STATE.update({"last_backup": now_ist("%d-%m-%Y %H:%M"), "ok": ok,
+                              "error": None if ok else f"HTTP {r.status_code}: {r.text[:120]}"})
+        return {"success": ok, "bytes": len(data), "message": message,
+                "error": None if ok else _BACKUP_STATE["error"]}
+    except Exception as e:
+        _BACKUP_STATE.update({"ok": False, "error": str(e)[:150]})
+        return {"success": False, "error": str(e)[:200]}
+
+
+def _auto_backup_loop():
+    while True:
+        time.sleep(max(60.0, BACKUP_MINUTES * 60))
+        try:
+            backup_db_to_github("auto")
+        except Exception:
+            pass
+
+
+if BACKUP_REPO and BACKUP_TOKEN and os.environ.get("GITHUB_BACKUP_RESTORE", "1") != "0":
+    try:
+        restore_db_from_github()
+    except Exception:
+        pass
 
 UA = ("Mozilla/5.0 (Linux; Android 13; SM-X210) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
@@ -238,6 +362,10 @@ _SETTINGS_CACHE: Dict[str, str] = {}
 
 
 def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
+    # v2.6: env override — SETTING_UPSTREAM_KEY=xyz (restart par bhi permanent)
+    _env = os.environ.get("SETTING_" + key.upper())
+    if _env not in (None, ""):
+        return _env
     if key in _SETTINGS_CACHE:
         return _SETTINGS_CACHE[key]
     try:
@@ -5311,6 +5439,8 @@ def validate_key(api_key: Optional[str]) -> Tuple[bool, str, str]:
     k = (api_key or "").strip()
     if not k:
         return False, "", "API key missing. Add ?key=Demo to the URL (or use your own key)."
+    if MASTER_API_KEYS and k in MASTER_API_KEYS:      # v2.6: env master key — hamesha valid
+        return True, k, ""
     if get_setting("demo_key_enabled", "1") == "1" and k == DEMO_KEY:
         return True, "Demo", ""
     row = key_row(k)
@@ -5326,6 +5456,12 @@ def key_record(api_key: Optional[str]) -> Optional[Dict[str, Any]]:
     k = (api_key or "").strip()
     if not k:
         return None
+    if MASTER_API_KEYS and k in MASTER_API_KEYS:
+        return {"id": -1, "api_key": k, "name": "MASTER (env)", "is_active": 1,
+                "expires_at": None, "allowed_endpoints": "*", "device_lock": 0,
+                "bound_devices": "", "max_devices": 1, "rate_limit": 0,
+                "customer": "HIMANSHU", "price": "0", "is_master": True,
+                "requests": 0, "note": "MASTER_API_KEY env se — restart par bhi zinda"}
     if get_setting("demo_key_enabled", "1") == "1" and k == DEMO_KEY:
         return {"id": 0, "api_key": DEMO_KEY, "name": "Demo", "is_active": 1,
                 "expires_at": None, "allowed_endpoints": "*", "device_lock": 0,
@@ -5787,6 +5923,24 @@ async def admin_login(request: Request, payload: Dict[str, Any] = Body(default={
     if password == get_setting("admin_password", ADMIN_PASSWORD):
         return {"success": True, "message": "Login ok"}
     return JSONResponse({"success": False, "error": "Wrong password"}, status_code=401)
+
+
+@app.post("/admin/backup/github")
+async def admin_backup_github(request: Request):
+    """Abhi turant DB ka GitHub backup banao (auto har BACKUP_MINUTES minute me bhi hota hai)."""
+    require_admin(request)
+    res = backup_db_to_github("manual")
+    res["state"] = dict(_BACKUP_STATE)
+    return res
+
+
+@app.post("/admin/restore/github")
+async def admin_restore_github(request: Request):
+    """GitHub backup se DB wapas lao (service restart karne par saaf lagu hota hai)."""
+    require_admin(request)
+    res = restore_db_from_github()
+    res["hint"] = "Restart the service (Render -> Manual Deploy) so poora fresh state load ho."
+    return res
 
 
 @app.get("/admin/overview")
@@ -6911,6 +7065,17 @@ async def health():
             "providers": {
                 "vehicle": "on" if _vp.get("url") else "off (VEHICLE_PROVIDER_URL set karo)",
                 "carrier": "on" if _np.get("url") else "off (NUMINFO_PROVIDER_URL set karo)",
+            },
+            "persistence": {
+                "master_keys": len(MASTER_API_KEYS),
+                "github_backup": (f"on -> {BACKUP_REPO}/{BACKUP_PATH}" if (BACKUP_REPO and BACKUP_TOKEN)
+                                  else "off (GITHUB_BACKUP_REPO + GITHUB_BACKUP_TOKEN set karo)"),
+                "restore": _BACKUP_STATE.get("restored"),
+                "last_backup": _BACKUP_STATE.get("last_backup"),
+                "last_backup_ok": _BACKUP_STATE.get("ok"),
+                "last_error": _BACKUP_STATE.get("error"),
+                "note": ("MASTER_API_KEY wali key restart par bhi chalti hai; baaki keys/records ke liye "
+                         "GitHub backup ya Render disk chahiye"),
             },
             "developer": brand(), "powered_by": brand_line()}
 
@@ -8147,6 +8312,33 @@ async def root(request: Request):
 @app.on_event("startup")
 async def on_startup():
     init_db()
+    # ---- v2.6: env master keys ko DB me seed karo (dashboard me dikhein + permanently zinda) ----
+    if MASTER_API_KEYS:
+        try:
+            with db() as conn:
+                for mk in MASTER_API_KEYS:
+                    row = conn.execute("SELECT id FROM api_keys WHERE api_key=?", (mk,)).fetchone()
+                    if row:
+                        conn.execute("UPDATE api_keys SET is_active=1 WHERE api_key=?", (mk,))
+                    else:
+                        conn.execute(
+                            "INSERT INTO api_keys(api_key,name,note,is_active,requests,created_at,"
+                            "expires_at,allowed_endpoints,device_lock,bound_devices,max_devices,rate_limit,"
+                            "customer,price) VALUES(?,?,?,1,0,?,?,?,?,?,?,?,?,?)",
+                            (mk, "MASTER (env)", "MASTER_API_KEY env se auto-seed", now_ist(), None,
+                             "*", 0, "", 1, 0, "HIMANSHU", ""))
+                conn.commit()
+        except Exception:
+            pass
+    # ---- v2.6: DB ko GitHub par auto-backup (free plan par DB udd jati hai) ----
+    if BACKUP_REPO and BACKUP_TOKEN:
+        import threading
+        if not any(t.name == "hub-db-backup" for t in threading.enumerate()):
+            threading.Thread(target=_auto_backup_loop, name="hub-db-backup", daemon=True).start()
+        try:
+            backup_db_to_github("startup")
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

@@ -21,6 +21,17 @@ services:
       # Public demo key (log free try kar sakein)
       - key: DEMO_KEY
         value: Demo
+      # ---------- v2.6 PERMANENCE (ZAROORI!) ----------
+      # Render free plan par DB file har restart/deploy me udd jati hai.
+      # Ye 3 env vars lagao -> aapki API key HAMESHA zinda rahegi:
+      - key: MASTER_API_KEY
+        sync: false            # aapki permanent key (dashboard se banao ya jo bhi ho)
+      - key: GITHUB_BACKUP_REPO
+        sync: false            # jaise: himanshu74919-cpu/hub-db-backup (PRIVATE repo)
+      - key: GITHUB_BACKUP_TOKEN
+        sync: false            # us repo ka token (repo scope)
+      - key: GITHUB_BACKUP_MINUTES
+        value: "15"
       # Branding — har response me dikhega
       - key: BRAND_TAG
         value: "@Supermannn_x"
