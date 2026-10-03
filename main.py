@@ -41,7 +41,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 # =====================================================================
 # CONFIGURATION  (everything can be changed from the dashboard too)
 # =====================================================================
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 DB_PATH = os.environ.get("DB_PATH", "osint_database.db")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -1154,6 +1154,131 @@ def parse_vehicle(number: str) -> Dict[str, Any]:
     info["local_db_note"] = ("Parsed offline from the registration format. Owner / challan / RC "
                              "details are only available through upstream or your own database.")
     return info
+
+
+# ---------------------------------------------------------------- Snapchat (native, v2.1)
+SNAP_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+
+
+def _snap_media(snap: Dict[str, Any]) -> str:
+    urls = snap.get("snapUrls") or {}
+    return (urls.get("mediaUrl") or (urls.get("mediaPreviewUrl") or {}).get("value") or "")
+
+
+async def _snap_profile(username: str) -> Tuple[Optional[Dict[str, Any]], str]:
+    username = re.sub(r"[^A-Za-z0-9_.\-]", "", (username or "").strip().lstrip("@"))
+    if not username:
+        return None, "username chahiye"
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True,
+                                     headers={"User-Agent": SNAP_UA,
+                                              "Accept-Language": "en-US,en;q=0.9"}) as client:
+            resp = await client.get(f"https://www.snapchat.com/add/{username}")
+        html = resp.text
+    except Exception:
+        return None, "Snapchat page nahi khula (network)"
+    m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.S)
+    if not m:
+        return None, "Snapchat ka data format badal gaya"
+    try:
+        page = json.loads(m.group(1))
+    except Exception:
+        return None, "Snapchat JSON parse nahi hua"
+    props = (page.get("props") or {}).get("pageProps") or {}
+    prof = ((props.get("userProfile") or {}).get("publicProfileInfo") or {})
+
+    def _snaps(items) -> List[Dict[str, Any]]:
+        out = []
+        for snap in (items or []):
+            url = _snap_media(snap)
+            if not url:
+                continue
+            ts = snap.get("timestampInSec")
+            if isinstance(ts, dict):
+                ts = ts.get("value")
+            out.append({"index": snap.get("snapIndex"), "type": snap.get("snapMediaType"),
+                        "timestamp": str(ts or ""), "title": snap.get("snapTitle") or "",
+                        "media_url": url})
+        return out
+
+    story = _snaps(((props.get("story") or {}).get("snapList")))
+    highlights = []
+    for hl in (props.get("curatedHighlights") or []):
+        snaps = _snaps(hl.get("snapList"))
+        if snaps:
+            highlights.append({"title": hl.get("storyTitle") or hl.get("storySubtitle") or "Highlight",
+                               "count": len(snaps), "snaps": snaps})
+    spotlight = []
+    for hl in (props.get("spotlightHighlights") or []):
+        snaps = _snaps(hl.get("snapList"))
+        if snaps:
+            spotlight.append({"title": hl.get("storyTitle") or "Spotlight", "snaps": snaps})
+
+    if not prof and not story and not highlights:
+        return None, f"@{username} ka public profile nahi mila (username check karo)"
+    return {
+        "success": True,
+        "username": prof.get("username") or username,
+        "display_name": prof.get("title") or "",
+        "subscribers": prof.get("subscriberCount") or "",
+        "bio": prof.get("bio") or "",
+        "website": prof.get("websiteUrl") or "",
+        "address": prof.get("address") or "",
+        "profile_picture": prof.get("profilePictureUrl") or "",
+        "has_story": bool(story),
+        "story": story,
+        "story_count": len(story),
+        "highlights": highlights,
+        "highlight_count": len(highlights),
+        "spotlight": spotlight,
+        "source": "snapchat.com (native parse)",
+    }, ""
+
+
+async def native_snap_stories(params: Dict[str, Any], request: Request) -> Tuple[Optional[Dict], bool]:
+    username = (params.get("username") or params.get("user") or params.get("q") or "").strip()
+    prof, err = await _snap_profile(username)
+    if not prof:
+        # 200 + saaf message (502 nahi) — bot se clean "not found" dikhe
+        return {"success": False, "username": username,
+                "error": err or f"@{username} ka public profile nahi mila",
+                "formatted": f"❌ Snapchat: {err or 'profile nahi mila'}"}, True
+    lines = [f"👻 Snapchat — @{prof['username']}",
+             f"👤 {prof['display_name'] or '-'}   •   👥 {prof['subscribers'] or '-'} subscribers"]
+    if prof.get("address"):
+        lines.append(f"📍 {prof['address']}")
+    if prof.get("bio"):
+        lines.append(f"📝 {prof['bio']}")
+    lines.append(f"📸 Story snaps: {prof['story_count']}")
+    for sn in prof["story"][:12]:
+        lines.append(f"   • {sn['media_url'][:110]}")
+    if prof["highlight_count"]:
+        lines.append(f"⭐ Highlights: {prof['highlight_count']} (pehla: {prof['highlights'][0]['title']})")
+    prof["formatted"] = "\n".join(lines)
+    return prof, False
+
+
+async def native_snap_highlights(params: Dict[str, Any], request: Request) -> Tuple[Optional[Dict], bool]:
+    username = (params.get("username") or params.get("user") or params.get("q") or "").strip()
+    prof, err = await _snap_profile(username)
+    if not prof:
+        return {"success": False, "username": username,
+                "error": err or f"@{username} ke highlights nahi mile",
+                "formatted": f"❌ Snapchat highlights: {err or 'kuch nahi mila'}"}, True
+    lines = [f"⭐ Snapchat Highlights — @{prof['username']}",
+             f"👥 {prof['subscribers'] or '-'} subscribers   •   ⭐ {prof['highlight_count']} highlights"]
+    for hl in prof["highlights"][:10]:
+        lines.append(f"\n📁 {hl['title']} ({hl['count']} snaps)")
+        for sn in hl["snaps"][:6]:
+            lines.append(f"   • {sn['media_url'][:110]}")
+    if prof["spotlight"]:
+        lines.append(f"\n🔥 Spotlight: {len(prof['spotlight'])} groups")
+    prof["formatted"] = "\n".join(lines)
+    return prof, False
+
+
+NATIVE_FUNCS_PATCHED = True
 
 
 def native_vehicle(kind: str):
@@ -3103,6 +3228,8 @@ NATIVE_FUNCS: Dict[str, Callable[..., Awaitable[Tuple[Optional[Dict], bool]]]] =
     "pass_check": native_pass_check,
     "aadhaar_family": native_aadhaar_family,
     "youtube_download": native_youtube_download,
+    "snap_stories": native_snap_stories,
+    "snap_highlights": native_snap_highlights,
 }
 for _kind in ("challan", "challan-v2", "challan-v4", "info", "info-v2", "rc", "details", "v"):
     NATIVE_FUNCS[f"vehicle_{_kind.replace('-', '_')}"] = None  # filled after loop (await below)
@@ -3187,12 +3314,12 @@ ENDPOINTS: List[Dict[str, Any]] = [
          desc="Search songs: upstream (Saavn download links) else Apple Music preview links."),
 
     # ---------- Social ----------
-    dict(path="snap-stories", name="Snapchat Stories", icon="👻", category="Social", native=None,
-         mode="upstream", params=[P("username", "priyapanchal272")],
-         desc="Snapchat public stories for a username."),
-    dict(path="snap-highlights", name="Snapchat Highlights", icon="👻", category="Social", native=None,
-         mode="upstream", params=[P("username", "priyapanchal272")],
-         desc="Snapchat public highlights for a username."),
+    dict(path="snap-stories", name="Snapchat Stories", icon="👻", category="Social",
+         native="snap_stories", mode="native", params=[P("username", "priyapanchal272")],
+         desc="Snapchat public stories (native parse) + profile info."),
+    dict(path="snap-highlights", name="Snapchat Highlights", icon="👻", category="Social",
+         native="snap_highlights", mode="native", params=[P("username", "priyapanchal272")],
+         desc="Snapchat public highlights + spotlight (native parse)."),
     dict(path="instagram-profile", name="Instagram Profile", icon="📸", category="Social", native=None,
          mode="upstream", params=[P("username", "sumit_sharma2")],
          desc="Instagram profile info (followers, bio, profile picture)."),
@@ -3505,6 +3632,20 @@ def over_rate_limit(api_key: str, per_key_limit: int = 0) -> bool:
 # =====================================================================
 # ENDPOINT RUNNER
 # =====================================================================
+PROVIDER_HINTS = {
+    "terabox-file": "TeraBox ke liye upstream provider key chahiye (Dashboard → Settings → upstream_key).",
+    "terabox-stream": "TeraBox ke liye upstream provider key chahiye (Dashboard → Settings → upstream_key).",
+    "terabox-stream-v2": "TeraBox ke liye upstream provider key chahiye.",
+    "terabox-stream-v3": "TeraBox ke liye upstream provider key chahiye.",
+    "instagram-profile": "Instagram apni website se server requests block karta hai — provider key ya proxy chahiye.",
+    "instagram-posts": "Instagram apni website se server requests block karta hai — provider key ya proxy chahiye.",
+    "bgmi": "BGMI/PUBG stats ke liye official/paid provider key chahiye.",
+    "youtube-download": "YouTube datacenter IP se download block karta hai — upstream provider key chahiye.",
+    "ytdl": "YouTube datacenter IP se download block karta hai — upstream provider key chahiye.",
+    "youtube-mp3": "YouTube datacenter IP se download block karta hai — upstream provider key chahiye.",
+}
+
+
 def error_payload(ep: Dict[str, Any], message: str, hint: Optional[str] = None) -> Dict[str, Any]:
     params = "&".join(f"{p['name']}={p['sample']}" for p in ep["params"])
     return {
@@ -3731,8 +3872,9 @@ async def run_endpoint(request: Request, ep: Dict[str, Any],
             detail = ("Upstream is switched off in the dashboard (Settings tab) and no native data "
                       "was available for this endpoint.")
         log_request(ep["path"], key_used, params, "error", 502, ms, client_ip(request))
+        _hint = PROVIDER_HINTS.get(ep["path"]) or detail
         return JSONResponse(error_payload(
-            ep, "Upstream / native source returned no data.", detail), status_code=502)
+            ep, "Upstream / native source returned no data.", _hint), status_code=502)
 
     payload = apply_brand(mark(payload, source, ep))
     ms = int((time.time() - started) * 1000)
@@ -4610,7 +4752,22 @@ async def api_create_order(request: Request, payload: Dict[str, Any] = Body(defa
     if not plan:
         return JSONResponse({"success": False, "error": "Plan nahi mila", "available": plans},
                             status_code=400)
-    amount = float(payload.get("amount") or plan.get("price") or 0)
+    # 🔒 v2.1 SECURITY: client ka bheja amount sirf standard plans me IGNORE hota hai.
+    if plan.get("id") == "custom":
+        rate = float(get_setting("custom_price_per_day", "0") or 0)
+        days = int(plan.get("days") or 30)
+        if rate <= 0:
+            return JSONResponse({
+                "success": False,
+                "error": "Custom plan ka price admin se confirm karo (ya store ke plan list se chuno).",
+                "hint": "Dashboard → Settings → store_plans me plan add karo, ya custom_price_per_day set karo.",
+                "available": plans,
+            }, status_code=400)
+        amount = round(rate * days, 2)
+    else:
+        amount = float(plan.get("price") or 0)      # server-side price (client amount ignore)
+        if float(payload.get("amount") or 0) > 0 and abs(float(payload.get("amount")) - amount) > 0.01:
+            amount = float(plan.get("price") or 0)  # chhoti rakam se order banane ki koshish block
     code = gen_order_code()
     with db() as conn:
         cur = conn.execute("INSERT INTO orders(order_code,customer_name,phone,plan_name,days,endpoints,"
@@ -4670,12 +4827,16 @@ def find_pending_order(remark: str, amount: float) -> Optional[sqlite3.Row]:
     except Exception:
         amt = 0
     if amt > 0:
+        # 🔒 v2.1: sirf EXACT match, aur wo bhi tab jab ek hi pending order ho (galat match na ho)
+        exact = []
         for row in rows:
             try:
-                if abs(float(row["amount"]) - amt) < 1:
-                    return row
+                if abs(float(row["amount"]) - amt) < 0.01:
+                    exact.append(row)
             except Exception:
                 continue
+        if len(exact) == 1:
+            return exact[0]
     return None
 
 
@@ -4706,6 +4867,14 @@ async def webhook_payment(request: Request, payload: Dict[str, Any] = Body(defau
         provided = request.headers.get("x-webhook-secret", "") or payload.get("secret", "")
         if provided != secret:
             return JSONResponse({"success": False, "error": "invalid webhook secret"}, status_code=401)
+    elif not admin_authorized(request):
+        # 🔒 v2.1 SECURITY: secret set na ho to webhook OPEN nahi rahega (warna koi bhi
+        # fake payment bhej kar key activate kar sakta tha).
+        return JSONResponse({
+            "success": False,
+            "error": "Webhook secure nahi hai — pehle webhook secret set karo.",
+            "hint": "Dashboard → Settings → webhook_secret me ek lamba secret daalo, phir SMS forwarder me wahi bhejo. (Ya admin token ke saath call karo.)",
+        }, status_code=401)
     amount = float(payload.get("amount") or 0)
     remark = str(payload.get("remark") or payload.get("note") or payload.get("tn") or "")
     utr = str(payload.get("utr") or payload.get("ref") or "")
