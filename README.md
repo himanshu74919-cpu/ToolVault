@@ -151,6 +151,14 @@ GITHUB_BACKUP_MINUTES = 15                   # optional, default 15
 * Manual control: `POST /admin/backup/github` (abhi backup) · `POST /admin/restore/github` (wapas lao)
 * Status: `GET /health` → `persistence` block.
 
+
+### ⚡ Env hamesha jeetegi (v2.6.4)
+Render → Environment me jo value set hai **wahi final** hai. Boot par wo value database me
+bhi likh di jati hai, isliye purani (galat) DB value kabhi env ko nahi dabaayegi.
+Ye lagta hai: `UPSTREAM_BASE`, `UPSTREAM_KEY`, `UPSTREAM_ENABLED`, `ADMIN_PASSWORD`,
+`BRAND_TAG`, `UPI_ID`, `UPI_NAME`, `WEBHOOK_SECRET`, `GITHUB_TOKEN`, `HIBP_API_KEY`,
+`CACHE_TTL`, `RATE_LIMIT_PER_MIN`, `MAX_REQUEST_SECONDS`, aur `SETTING_<NAAM>` (koi bhi setting).
+
 ### Settings bhi permanent
 `SETTING_<NAAM>` env se koi bhi dashboard setting lock kar sakte ho, jaise:
 ```

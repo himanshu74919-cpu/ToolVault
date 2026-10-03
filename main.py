@@ -43,7 +43,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 # =====================================================================
 # CONFIGURATION  (everything can be changed from the dashboard too)
 # =====================================================================
-APP_VERSION = "2.6.3"
+APP_VERSION = "2.6.4"
 DB_PATH = os.environ.get("DB_PATH", "osint_database.db")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -331,6 +331,47 @@ def init_db():
     for k, v in defaults.items():
         if get_setting(k) is None:
             set_setting(k, v)
+
+    # ---- v2.6.4: Render env hamesha JEETEGI ----
+    # Pehle: DB ki purani value env ko dabaa deti thi (jaise upstream_key="Demo").
+    # Ab: jo cheez env me set hai, wo boot par DB me bhi likh di jati hai -> env = final.
+    env_sync = {
+        "upstream_base": os.environ.get("UPSTREAM_BASE"),
+        "upstream_key": os.environ.get("UPSTREAM_KEY"),
+        "upstream_enabled": os.environ.get("UPSTREAM_ENABLED"),
+        "admin_password": os.environ.get("ADMIN_PASSWORD"),
+        "brand_tag": os.environ.get("BRAND_TAG"),
+        "upi_id": os.environ.get("UPI_ID"),
+        "upi_name": os.environ.get("UPI_NAME"),
+        "webhook_secret": os.environ.get("WEBHOOK_SECRET"),
+        "github_token": os.environ.get("GITHUB_TOKEN"),
+        "hibp_api_key": os.environ.get("HIBP_API_KEY"),
+        "cache_ttl": os.environ.get("CACHE_TTL"),
+        "rate_limit_per_min": os.environ.get("RATE_LIMIT_PER_MIN"),
+        "max_request_seconds": os.environ.get("MAX_REQUEST_SECONDS"),
+        "telegram_support": os.environ.get("TELEGRAM_SUPPORT"),
+        "store_title": os.environ.get("STORE_TITLE"),
+        "store_tagline": os.environ.get("STORE_TAGLINE"),
+    }
+    for _k, _v in list(os.environ.items()):        # SETTING_XXXX=value -> setting "xxxx"
+        if _k.startswith("SETTING_") and _v:
+            env_sync[_k[len("SETTING_"):].lower()] = _v
+    _synced = []
+    for k, v in env_sync.items():
+        if v not in (None, ""):
+            try:
+                set_setting(k, str(v))
+                _synced.append(k)
+            except Exception:
+                pass
+    if _synced:
+        try:
+            with db() as conn:
+                conn.execute("INSERT INTO settings(k,v) VALUES('env_synced_keys',?) "
+                             "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (",".join(sorted(_synced)),))
+                conn.commit()
+        except Exception:
+            pass
 
 
 NEW_KEY_COLUMNS = {
