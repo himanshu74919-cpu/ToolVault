@@ -43,7 +43,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 # =====================================================================
 # CONFIGURATION  (everything can be changed from the dashboard too)
 # =====================================================================
-APP_VERSION = "2.6.2"
+APP_VERSION = "2.6.3"
 DB_PATH = os.environ.get("DB_PATH", "osint_database.db")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -5698,6 +5698,11 @@ async def run_endpoint(request: Request, ep: Dict[str, Any],
                 "vahan": "https://vahan.parivahan.gov.in/nrservices/faces/user/searchstatus.xhtml",
                 "echallan": "https://echallan.parivahan.gov.in/index/accused-challan",
             }
+        elif path in {"num-info", "number-info", "num"}:
+            message = ("Number info: LEGAL carrier lookup (operator/circle/type/MNP) ke liye apni API lagao — "
+                       "NUMINFO_PROVIDER_URL + NUMINFO_PROVIDER_KEY (Render env). "
+                       "Leaked personal records (naam/pata) jaan-boojh kar supported nahi — wo illegal hai.")
+            links = {"mnp_verify": "https://tafcop.dgtelecom.gov.in/", "sanchar_saathi": "https://sancharsaathi.gov.in/"}
         elif path.startswith("aadhaar") or path == "ration":
             message = "Aadhaar/family lookup yahan available nahi. UIDAI/NFSA ke official consent-based portal ka use karein."
             links = {"uidai": "https://myaadhaar.uidai.gov.in/", "nfsa": "https://nfsa.gov.in/"}
