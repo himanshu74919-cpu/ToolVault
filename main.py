@@ -43,7 +43,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 # =====================================================================
 # CONFIGURATION  (everything can be changed from the dashboard too)
 # =====================================================================
-APP_VERSION = "2.6.1"
+APP_VERSION = "2.6.2"
 DB_PATH = os.environ.get("DB_PATH", "osint_database.db")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -7142,6 +7142,33 @@ async def _startup_tac_index():
     _th.Thread(target=_build_tac_index, daemon=True).start()
 
 
+def _action_list() -> List[str]:
+    """/health par saaf list: kya-kya set karna baaki hai (user ke liye)."""
+    todo: List[str] = []
+    if not MASTER_API_KEYS:
+        todo.append("MASTER_API_KEY env lagao — tab aapki main API key restart par bhi chalti rahegi")
+    elif not key_row_safe(MASTER_API_KEYS[0]):
+        todo.append("MASTER_API_KEY set hai (theek hai) — DB me seed neeche rows me ho jayegi")
+    if not (BACKUP_REPO and BACKUP_TOKEN):
+        todo.append("GITHUB_BACKUP_REPO + GITHUB_BACKUP_TOKEN lagao — keys/records ka backup chalu ho jayega")
+    if get_setting("admin_password", ADMIN_PASSWORD) == "admin123":
+        todo.append("ADMIN_PASSWORD env lagao — dashboard default password se badal do (security)")
+    if _UPSTREAM_STATE.get("key_ok") is False:
+        todo.append("SETTING_UPSTREAM_KEY lagao — abhi upstream key invalid hai (GST/PAN live data nahi)")
+    if not vehicle_provider().get("url"):
+        todo.append("VEHICLE_PROVIDER_URL + KEY lagao — vehicle/challan live data chalu ho jayega")
+    if not numinfo_provider().get("url"):
+        todo.append("NUMINFO_PROVIDER_URL + KEY lagao — number carrier (operator/circle) live data")
+    return todo
+
+
+def key_row_safe(k: str) -> bool:
+    try:
+        return bool(key_row(k))
+    except Exception:
+        return False
+
+
 @app.get("/health")
 async def health():
     _vp = vehicle_provider()
@@ -7164,6 +7191,13 @@ async def health():
                 "note": ("MASTER_API_KEY wali key restart par bhi chalti hai; baaki keys/records ke liye "
                          "GitHub backup ya Render disk chahiye"),
             },
+            "security": {
+                "admin_password_is_default": (get_setting("admin_password", ADMIN_PASSWORD) == "admin123"),
+                "hint": ("KHATRA: dashboard password abhi default 'admin123' hai — Render env me "
+                         "ADMIN_PASSWORD=apna-password lagao (warna restart ke baad koi bhi login kar sakta hai)")
+                        if get_setting("admin_password", ADMIN_PASSWORD) == "admin123" else "ok",
+            },
+            "action_needed": _action_list(),
             "developer": brand(), "powered_by": brand_line()}
 
 
