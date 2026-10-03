@@ -1232,6 +1232,14 @@ async def _snap_profile(username: str) -> Tuple[Optional[Dict[str, Any]], str]:
         "highlights": highlights,
         "highlight_count": len(highlights),
         "spotlight": spotlight,
+        # 🤖 bot-friendly flat list (Telegram bots seedha url utha lein)
+        "stories": (
+            [{"url": s["media_url"], "type": "story", "timestamp": s.get("timestamp")} for s in story]
+            + [{"url": s["media_url"], "type": "highlight", "title": hl["title"],
+                "timestamp": s.get("timestamp")} for hl in highlights for s in hl["snaps"]]
+            + [{"url": s["media_url"], "type": "spotlight", "title": hl["title"],
+                "timestamp": s.get("timestamp")} for hl in spotlight for s in hl["snaps"]]
+        ),
         "source": "snapchat.com (native parse)",
     }, ""
 
@@ -1266,6 +1274,7 @@ async def native_snap_highlights(params: Dict[str, Any], request: Request) -> Tu
         return {"success": False, "username": username,
                 "error": err or f"@{username} ke highlights nahi mile",
                 "formatted": f"❌ Snapchat highlights: {err or 'kuch nahi mila'}"}, True
+    prof.pop("stories", None)   # highlights endpoint par sirf highlights
     lines = [f"⭐ Snapchat Highlights — @{prof['username']}",
              f"👥 {prof['subscribers'] or '-'} subscribers   •   ⭐ {prof['highlight_count']} highlights"]
     for hl in prof["highlights"][:10]:
