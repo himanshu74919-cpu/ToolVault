@@ -43,7 +43,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 # =====================================================================
 # CONFIGURATION  (everything can be changed from the dashboard too)
 # =====================================================================
-APP_VERSION = "2.6.6"
+APP_VERSION = "2.6.7"
 DB_PATH = os.environ.get("DB_PATH", "osint_database.db")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -358,12 +358,19 @@ def init_db():
             env_sync[_k[len("SETTING_"):].lower()] = _v
     _synced = []
     for k, v in env_sync.items():
-        if v not in (None, ""):
-            try:
-                set_setting(k, str(v))
-                _synced.append(k)
-            except Exception:
-                pass
+        if v in (None, ""):
+            continue
+        # v2.6.7 suraksha: insecure default kabhi aapke asli password ko overwrite na kare
+        if k == "admin_password" and str(v) == "admin123":
+            _cur = get_setting("admin_password", "") or ""
+            if _cur and _cur != "admin123":
+                _synced.append(k + "(rakha-default-ignore)")
+                continue
+        try:
+            set_setting(k, str(v))
+            _synced.append(k)
+        except Exception:
+            pass
     if _synced:
         try:
             with db() as conn:
