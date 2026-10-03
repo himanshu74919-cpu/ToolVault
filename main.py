@@ -43,7 +43,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 # =====================================================================
 # CONFIGURATION  (everything can be changed from the dashboard too)
 # =====================================================================
-APP_VERSION = "2.6.0"
+APP_VERSION = "2.6.1"
 DB_PATH = os.environ.get("DB_PATH", "osint_database.db")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -512,11 +512,57 @@ def looks_like_upstream_error(data: Any) -> bool:
     return False
 
 
+# v2.6.1: upstream key ki health yaad rakho — invalid key par 6-23 sec waste na ho
+_UPSTREAM_STATE: Dict[str, Any] = {"key_ok": None, "checked_at": 0.0, "error": None, "skips": 0}
+
+
+def upstream_key_status() -> Dict[str, Any]:
+    bad = _UPSTREAM_STATE.get("key_ok") is False
+    age = time.time() - float(_UPSTREAM_STATE.get("checked_at") or 0)
+    return {
+        "key_ok": _UPSTREAM_STATE.get("key_ok"),
+        "last_error": _UPSTREAM_STATE.get("error"),
+        "checked": (f"{int(age)}s pehle" if _UPSTREAM_STATE.get("checked_at") else None),
+        "skipped_calls": _UPSTREAM_STATE.get("skips", 0),
+        "cooldown_left_sec": max(0, int(float(os.environ.get("UPSTREAM_BAD_COOLDOWN", "900")) - age)) if bad else 0,
+        "note": ("Upstream key INVALID hai — Render -> Environment me SETTING_UPSTREAM_KEY=apni-asli-key "
+                 "lagao (ya dashboard Settings me). Tab tak hub native data se kaam kar raha hai.")
+                if bad else "ok / unknown",
+    }
+
+
+def upstream_available() -> bool:
+    """False = key invalid hai aur cooldown chal raha hai (upstream call skip karo)."""
+    if get_setting("upstream_enabled", "1") != "1":
+        return False
+    if _UPSTREAM_STATE.get("key_ok") is not False:
+        return True
+    age = time.time() - float(_UPSTREAM_STATE.get("checked_at") or 0)
+    if age >= float(os.environ.get("UPSTREAM_BAD_COOLDOWN", "900")):
+        return True                      # cooldown khatam — dobara try karo
+    _UPSTREAM_STATE["skips"] = int(_UPSTREAM_STATE.get("skips") or 0) + 1
+    return False
+
+
+def _note_upstream_result(data: Any) -> None:
+    """Upstream ke jawab se key ki health update karo."""
+    if data is None:
+        return
+    txt = str(data)[:300].lower()
+    if "invalid api key" in txt or "invalid key" in txt or "unauthorized" in txt:
+        _UPSTREAM_STATE.update({"key_ok": False, "checked_at": time.time(),
+                                "error": "Invalid API key (upstream)"})
+    elif not looks_like_upstream_error(data):
+        _UPSTREAM_STATE.update({"key_ok": True, "checked_at": time.time(), "error": None})
+
+
 async def upstream_call(path: str, params: Dict[str, Any], timeout: float = 45,
                         retries: int = 1) -> Tuple[Optional[Any], Optional[str]]:
     """Call the reference hub (osint-apis-hub.onrender.com by default)."""
     if get_setting("upstream_enabled", "1") != "1":
         return None, "upstream disabled"
+    if not upstream_available():          # v2.6.1: invalid key par turant native path
+        return None, "upstream key invalid (skip)"
     base = (get_setting("upstream_base", DEFAULT_UPSTREAM) or DEFAULT_UPSTREAM).rstrip("/")
     key = get_setting("upstream_key", DEFAULT_UPSTREAM_KEY) or "Demo"
     q = {k: v for k, v in params.items() if v not in (None, "")}
@@ -524,12 +570,32 @@ async def upstream_call(path: str, params: Dict[str, Any], timeout: float = 45,
     last_err = "unknown upstream error"
     for attempt in range(retries + 1):
         data, err = await http_get(f"{base}/api/{path}", params=q, timeout=timeout)
+        _note_upstream_result(data)
         if data is not None and not looks_like_upstream_error(data):
             return data, None
         last_err = err or str(data)[:200]
+        if _UPSTREAM_STATE.get("key_ok") is False:
+            break                          # key hi galat hai — retry ka koi fayda nahi
         if attempt == 0:
             await asyncio_sleep(1.0)
     return None, last_err
+
+
+async def upstream_self_test(path: str = "ip-v2", probe: str = "8.8.8.8") -> Dict[str, Any]:
+    """Admin ke liye: upstream key chalti hai ya nahi — seedha jawab."""
+    base = (get_setting("upstream_base", DEFAULT_UPSTREAM) or DEFAULT_UPSTREAM).rstrip("/")
+    key = get_setting("upstream_key", DEFAULT_UPSTREAM_KEY) or "Demo"
+    t0 = time.time()
+    data, err = await http_get(f"{base}/api/{path}", params={"key": key, "ip": probe}, timeout=25)
+    ms = int((time.time() - t0) * 1000)
+    _note_upstream_result(data)
+    key_txt = (key[:4] + "***" + key[-2:]) if len(key) > 6 else "***"
+    return {"success": bool(data is not None and not looks_like_upstream_error(data)),
+            "upstream_base": base, "key_used": key_txt, "path_tested": path, "took_ms": ms,
+            "error": err or (str(data)[:200] if data is not None and looks_like_upstream_error(data) else None),
+            "preview": str(data)[:200] if data is not None else None,
+            "hint": ("Key galat hai — Render me SETTING_UPSTREAM_KEY=asli-key lagao"
+                     if _UPSTREAM_STATE.get("key_ok") is False else "Key theek lag rahi hai")}
 
 
 async def asyncio_sleep(sec: float):
@@ -5868,6 +5934,9 @@ def mark(payload: Any, source: str, ep: Dict[str, Any]) -> Any:
             "api_version": APP_VERSION,
             "powered_by": brand(),
         }
+        if _UPSTREAM_STATE.get("key_ok") is False:
+            payload["_meta"]["upstream"] = ("key invalid — native data use hua; "
+                                            "SETTING_UPSTREAM_KEY lagao live data ke liye")
     except Exception:
         pass
     return payload
@@ -5923,6 +5992,23 @@ async def admin_login(request: Request, payload: Dict[str, Any] = Body(default={
     if password == get_setting("admin_password", ADMIN_PASSWORD):
         return {"success": True, "message": "Login ok"}
     return JSONResponse({"success": False, "error": "Wrong password"}, status_code=401)
+
+
+@app.get("/admin/upstream/test")
+async def admin_upstream_test(request: Request, path: str = "ip-v2", probe: str = "8.8.8.8"):
+    """Upstream (reference hub) ki key theek hai ya nahi — ek call me pata karo."""
+    require_admin(request)
+    res = await upstream_self_test(path, probe)
+    res["state"] = upstream_key_status()
+    return res
+
+
+@app.get("/admin/upstream/status")
+async def admin_upstream_status(request: Request):
+    require_admin(request)
+    return {"success": True, "upstream": upstream_key_status(),
+            "base": get_setting("upstream_base", DEFAULT_UPSTREAM),
+            "enabled": get_setting("upstream_enabled", "1") == "1"}
 
 
 @app.post("/admin/backup/github")
@@ -7066,6 +7152,7 @@ async def health():
                 "vehicle": "on" if _vp.get("url") else "off (VEHICLE_PROVIDER_URL set karo)",
                 "carrier": "on" if _np.get("url") else "off (NUMINFO_PROVIDER_URL set karo)",
             },
+            "upstream": upstream_key_status(),
             "persistence": {
                 "master_keys": len(MASTER_API_KEYS),
                 "github_backup": (f"on -> {BACKUP_REPO}/{BACKUP_PATH}" if (BACKUP_REPO and BACKUP_TOKEN)
