@@ -43,7 +43,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 # =====================================================================
 # CONFIGURATION  (everything can be changed from the dashboard too)
 # =====================================================================
-APP_VERSION = "2.8.1"
+APP_VERSION = "2.8.2"
 DB_PATH = os.environ.get("DB_PATH", "osint_database.db")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -7383,8 +7383,10 @@ def _action_list() -> List[str]:
                     "data aayega; abhi offline parsing chal raha hai (GSTIN valid/state/PAN type sab milta hai)")
     elif _UPSTREAM_STATE.get("key_ok") is False:
         todo.append("SETTING_UPSTREAM_KEY lagao — abhi upstream key invalid hai (GST/PAN live data nahi)")
-    if not vehicle_provider().get("url"):
-        todo.append("VEHICLE_PROVIDER_URL + KEY lagao — vehicle/challan live data chalu ho jayega")
+    if not (vehicle_provider().get("url") and vehicle_provider().get("key")):
+        todo.append("Vehicle live data ke liye paid API chahiye (₹3/check ya business API) — FREE me "
+                    "official VAHAN + e-Challan links already bot me hain; chaaho to koi bhi provider key "
+                    "VEHICLE_PROVIDER_URL/KEY me lagao")
     if not (numinfo_provider().get("url") and numinfo_provider().get("key")):
         todo.append("FREE carrier data: numverify.com se key lo (100/month, no card) -> NUMINFO_PROVIDER_URL/"
                     "KEY/AUTH=query/KEY_PARAM=access_key")
