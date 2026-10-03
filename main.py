@@ -41,7 +41,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 # =====================================================================
 # CONFIGURATION  (everything can be changed from the dashboard too)
 # =====================================================================
-APP_VERSION = "2.3.1"
+APP_VERSION = "2.3.2"
 DB_PATH = os.environ.get("DB_PATH", "osint_database.db")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -2975,7 +2975,7 @@ async def native_youtube_download(params: Dict[str, Any], request: Request) -> T
                     None, lambda: _yt_extract(watch, "audio" if mode == "audio" else mode,
                                               quality,
                                               timeout=int(min(25, max(8, hard_deadline - (time.time() - started) - 4))),
-                                              budget=float(min(9, max(4, hard_deadline - (time.time() - started) - 8)))))
+                                              budget=float(min(6, max(4, hard_deadline - (time.time() - started) - 10)))))
             except Exception as exc:  # noqa: BLE001
                 out = {"error": str(exc)[:200]}
             ytdlp_err = out.get("error")
