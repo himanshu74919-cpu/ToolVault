@@ -10,21 +10,18 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
-      # Dashboard ka password. Deploy ke baad badal lena (Environment tab se).
+      # Dashboard ka password — dashboard me jo daala wahi chalega (sync: false)
+      # (pehle yahan value: admin123 hardcoded thi -> har deploy par aapka password reset ho jata tha!)
       - key: ADMIN_PASSWORD
-        value: admin123
-      # Upstream free OSINT source
+        sync: false
+      # Upstream OSINT source — dashboard me jo set karoge wahi chalega
       - key: UPSTREAM_BASE
-        value: https://osint-apis-hub.onrender.com
+        sync: false            # khali chhodo = https://osint-apis-hub.onrender.com
       - key: UPSTREAM_KEY
-        value: Demo
-      # Public demo key (log free try kar sakein)
+        sync: false            # YAHAN APNI VALID KEY DAALO (Demo invalid hai)
+      # Public demo key (khali chhodo = Demo)
       - key: DEMO_KEY
-        value: Demo
-      - key: UPSTREAM_BASE
-        sync: false            # reference hub ka URL (default osint-apis-hub.onrender.com)
-      - key: UPSTREAM_KEY
-        sync: false            # us hub ki VALID key (Demo invalid hai) -> GST/PAN live data
+        sync: false
       # ---------- v2.6 PERMANENCE (ZAROORI!) ----------
       # Render free plan par DB file har restart/deploy me udd jati hai.
       # Ye 3 env vars lagao -> aapki API key HAMESHA zinda rahegi:
