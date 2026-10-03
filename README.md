@@ -115,6 +115,23 @@ Dono green hone par hi push karo — `precheck.py` push guard hai.
 
 ---
 
+## 🔑 APNI API KEY KAISE LE (dashboard se)
+
+1. Kholo **https://osint-api-hub.onrender.com/dashboard**
+2. Password daalo (jo aapne Render me `ADMIN_PASSWORD` env me rakha hai; default `admin123`)
+3. **API Keys** tab → **+ New Key** → naam likho → **Create**
+4. Key copy karo (jaise `osint-xxxxxxxx`) aur use karo:
+   `https://osint-api-hub.onrender.com/api/ip-v2?key=osint-xxxxxxxx&ip=8.8.8.8`
+
+⚠️ **Ye key ab bhi restart par udd sakti hai** (Render free plan ka ephemeral disk) —
+permanent karne ke liye `MASTER_API_KEY` env lagao (upar dekho).
+
+### Kaun-kaun se endpoints live hain
+`ENDPOINT-REPORT.md` file dekho — poore live test ka result:
+35 OK · 11 par aapki licensed API lagane se live · 12 policy se band (leaked personal data) · **0 broken**.
+
+---
+
 ## 💾 PERMANENCE (v2.6) — API keys kabhi na ude
 
 ⚠️ **Render free plan par filesystem ephemeral hai** — service restart / spin-down / redeploy
