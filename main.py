@@ -27,6 +27,7 @@ import re
 import secrets
 import sqlite3
 import time
+import html as html_lib
 import urllib.parse
 import asyncio
 from contextlib import contextmanager
@@ -41,7 +42,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 # =====================================================================
 # CONFIGURATION  (everything can be changed from the dashboard too)
 # =====================================================================
-APP_VERSION = "2.3.2"
+APP_VERSION = "2.5.1"
 DB_PATH = os.environ.get("DB_PATH", "osint_database.db")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -937,6 +938,326 @@ async def native_ip_v3(params: Dict[str, Any], request: Request) -> Tuple[Option
             "source": "ipinfo.io"}, False
 
 
+# ---------------------------------------------------------------------
+# v2.4 — TAC DATABASE (255k rows) + nanoreview specs engine
+# ---------------------------------------------------------------------
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+TAC_CSV_PATH = os.path.join(DATA_DIR, "tac_full.csv")
+TAC_DB_PATH = os.path.join(DATA_DIR, "tac_index.db")
+_tac_state: Dict[str, Any] = {"ready": False, "err": "", "count": 0, "tried": False}
+
+
+def _clean_html(t: str) -> str:
+    t = re.sub(r"<[^>]+>", " ", str(t or ""))
+    t = html_lib.unescape(t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _build_tac_index() -> None:
+    """CSV → SQLite (ek baar). 255k rows ~2-4s."""
+    if _tac_state["tried"]:
+        return
+    _tac_state["tried"] = True
+    try:
+        import csv as _csv
+        import sqlite3 as _sq
+        if not os.path.exists(TAC_CSV_PATH):
+            _tac_state["err"] = "tac_full.csv repo me nahi mila"
+            return
+        if os.path.exists(TAC_DB_PATH) and os.path.getsize(TAC_DB_PATH) > 1_000_000:
+            con = _sq.connect(TAC_DB_PATH)
+            n = con.execute("SELECT COUNT(*) FROM tac").fetchone()[0]
+            con.close()
+            _tac_state.update({"ready": True, "count": int(n)})
+            return
+        tmp = TAC_DB_PATH + ".tmp"
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        con = _sq.connect(tmp)
+        con.execute("CREATE TABLE tac(tac TEXT PRIMARY KEY, brand TEXT, device TEXT, extra TEXT)")
+        batch: List[Tuple[str, str, str, str]] = []
+        with io.open(TAC_CSV_PATH, encoding="utf-8", errors="ignore") as fh:
+            rd = _csv.reader(fh)
+            next(rd, None)
+            for row in rd:
+                if len(row) < 3:
+                    continue
+                brand = str(row[0]).strip().upper()
+                tac = re.sub(r"\D", "", str(row[1]))[:8]
+                if len(tac) < 8:
+                    continue
+                parts = [p.strip() for p in str(row[2]).split(",") if p.strip()]
+                device, extra = "", ""
+                if parts:
+                    if parts[0].upper().replace(" ", "") == brand.replace(" ", ""):
+                        device = parts[1] if len(parts) > 1 else parts[0]
+                        extra = ", ".join(parts[2:])
+                    else:
+                        device = parts[0]
+                        extra = ", ".join(parts[1:])
+                batch.append((tac, brand, device, extra))
+                if len(batch) >= 20000:
+                    con.executemany("INSERT OR REPLACE INTO tac VALUES(?,?,?,?)", batch)
+                    batch.clear()
+        if batch:
+            con.executemany("INSERT OR REPLACE INTO tac VALUES(?,?,?,?)", batch)
+        con.commit()
+        n = con.execute("SELECT COUNT(*) FROM tac").fetchone()[0]
+        con.close()
+        os.replace(tmp, TAC_DB_PATH)
+        _tac_state.update({"ready": True, "count": int(n)})
+    except Exception as exc:  # noqa: BLE001
+        _tac_state["err"] = f"{type(exc).__name__}: {str(exc)[:120]}"
+
+
+def _tac_lookup(tac: str) -> Optional[Dict[str, Any]]:
+    """TAC (8 digits) → {brand, device, extra}. Index ready hone ka chhota wait."""
+    if not _tac_state["ready"] and not _tac_state["tried"]:
+        _build_tac_index()
+    waited = 0.0
+    while not _tac_state["ready"] and waited < 6:
+        time.sleep(0.25)
+        waited += 0.25
+        if _tac_state["err"]:
+            break
+    if not _tac_state["ready"]:
+        return None
+    try:
+        con = sqlite3.connect(TAC_DB_PATH, timeout=5)
+        row = con.execute("SELECT brand, device, extra FROM tac WHERE tac=?", (tac,)).fetchone()
+        con.close()
+        if not row:
+            return None
+        return {"brand": row[0], "device": row[1], "extra": row[2] or ""}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _model_codes(device: str, extra: str) -> List[str]:
+    codes: List[str] = []
+    for m in re.finditer(r"\b([A-Z]{1,4}[-\s]?[A-Z0-9]{2,}(?:[-/][A-Z0-9]+)*\d{2,}[A-Z0-9/]*)\b", f"{device} {extra}"):
+        c = m.group(1).strip()
+        if len(c) >= 5 and c not in codes:
+            codes.append(c)
+    return codes[:10]
+
+
+_NR_CACHE: Dict[str, Any] = {}
+
+
+def _nr_slug(name: str) -> str:
+    t = str(name or "").lower()
+    t = t.replace("+", " plus ").replace("(", " ").replace(")", " ")
+    t = re.sub(r"[^a-z0-9]+", "-", t).strip("-")
+    return t
+
+
+async def _device_specs_fetch(model: str, brand: str = "") -> Optional[Dict[str, Any]]:
+    """nanoreview.net se device page → photo + spec sections (tables)."""
+    model = re.sub(r"\s+", " ", str(model or "")).strip()
+    if len(model) < 3:
+        return None
+    key = _nr_slug(model)[:90]
+    hit = _NR_CACHE.get(key)
+    if hit and (time.time() - hit[0]) < 86400:
+        return hit[1]
+
+    import httpx
+    slug = _nr_slug(model)
+    if brand and not slug.startswith(_nr_slug(brand)):
+        slug = _nr_slug(f"{brand} {model}")
+    urls = [f"https://nanoreview.net/en/{kind}/{slug}" for kind in ("tablet", "phone")]
+    html = ""
+    used_url = ""
+    headers = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9", "Accept": "text/html,*/*"}
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers=headers) as client:
+            for u in urls:
+                try:
+                    r = await client.get(u)
+                    if r.status_code == 200 and "specs-table" in r.text:
+                        html, used_url = r.text, u
+                        break
+                except Exception:  # noqa: BLE001
+                    continue
+            if not html:
+                # DuckDuckGo se sahi nanoreview URL dhoondo
+                try:
+                    d = await client.get("https://html.duckduckgo.com/html/",
+                                         params={"q": f"site:nanoreview.net {model}"})
+                    for m in re.finditer(r"uddg=([^&\"]+)", d.text):
+                        cand = urllib.parse.unquote(m.group(1))
+                        if "nanoreview.net" in cand and "/en/" in cand:
+                            rr = await client.get(cand)
+                            if rr.status_code == 200 and "specs-table" in rr.text:
+                                html, used_url = rr.text, cand
+                                break
+                except Exception:  # noqa: BLE001
+                    pass
+    except Exception:  # noqa: BLE001
+        return None
+    if not html:
+        return None
+
+    # v2.4b: tables ko unke HEADING (h3) ke hisaab se group karo — "Display", "Design and build",
+    # "Performance", "Memory", "Battery", "Main camera"… (pehle sab "Specs"/caption the)
+    SKIP_HEADS = {"review", "full specifications", "competitors", "comments", "recent user tests",
+                  "benchmarks", "benchmark"}
+
+    heads = [(m.start(), _clean_html(m.group(2)))
+             for m in re.finditer(r'<h([1-4])[^>]*>(.*?)</h\1>', html, re.S)]
+    heads = [(p, t) for p, t in heads if t and t.lower().strip("()0123456789 ") not in SKIP_HEADS
+             and not t.lower().startswith(("comment", "recent user", "benchmark"))]
+
+    sections: List[Dict[str, Any]] = []
+    by_title: Dict[str, Dict[str, Any]] = {}
+
+    def _sec(title: str) -> Dict[str, Any]:
+        title = (title or "Specs")[:48]
+        if title not in by_title:
+            sec = {"title": title, "rows": []}
+            by_title[title] = sec
+            sections.append(sec)
+        return by_title[title]
+
+    for tm in re.finditer(r'<table class="specs-table">(.*?)</table>', html, re.S):
+        pos, tb = tm.start(), tm.group(1)
+        title = ""
+        for hp, ht in heads:
+            if hp < pos:
+                title = ht
+            else:
+                break
+        rows = []
+        for k, v in re.findall(r'<td class="cell-h">(.*?)</td>\s*<td class="cell-s">(.*?)</td>', tb, re.S):
+            kk, vv = _clean_html(k), _clean_html(v)
+            if kk and vv and len(vv) < 300:
+                rows.append([kk, vv])
+        if not rows:
+            continue
+        sec = _sec(title or "Specs")
+        for r in rows:
+            if len(sec["rows"]) < 22 and r not in sec["rows"]:
+                sec["rows"].append(r)
+    sections = [x for x in sections if x["rows"]]
+    name = ""
+    h1 = re.search(r"<h1[^>]*>(.*?)</h1>", html, re.S)
+    if h1:
+        name = _clean_html(h1.group(1))
+    if not name:
+        ti = re.search(r"<title>(.*?)</title>", html, re.S)
+        name = _clean_html(ti.group(1)).split(":")[0] if ti else model
+    img = re.search(r'src="(/common/images/(?:tablet|phone)/[^"]+?@2x\.jpeg)"', html)
+    image = ("https://nanoreview.net" + img.group(1)) if img else ""
+    out = {
+        "success": bool(sections),
+        "name": name[:90],
+        "url": used_url,
+        "image": image,
+        "sections": sections,
+        "row_count": sum(len(x["rows"]) for x in sections),
+        "source": "nanoreview.net",
+    }
+    if out["success"]:
+        _NR_CACHE[key] = (time.time(), out)
+        if len(_NR_CACHE) > 400:
+            for k in sorted(_NR_CACHE, key=lambda x: _NR_CACHE[x][0])[:150]:
+                _NR_CACHE.pop(k, None)
+    return out if out["success"] else None
+
+
+_WIKI_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+async def _wiki_device_extra(name: str) -> Dict[str, Any]:
+    """Wikipedia infobox se model codes (SM-X210…), release year aur HD image. Best-effort."""
+    out: Dict[str, Any] = {}
+    q = re.sub(r"[^A-Za-z0-9 +-]+", " ", str(name or "")).strip()
+    key = q.lower()
+    if len(q) < 4:
+        return out
+    if key in _WIKI_CACHE:
+        return dict(_WIKI_CACHE[key])
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True,
+                                     headers={"User-Agent": UA}) as client:
+            r = await client.get("https://en.wikipedia.org/w/api.php",
+                                 params={"action": "query", "prop": "revisions", "rvprop": "content",
+                                         "rvslots": "main", "format": "json", "redirects": "1",
+                                         "titles": q})
+            if r.status_code != 200:
+                return out
+            pages = ((r.json().get("query") or {}).get("pages") or {})
+            content = ""
+            for _pid, pg in pages.items():
+                try:
+                    content = pg["revisions"][0]["slots"]["main"]["*"]
+                except Exception:  # noqa: BLE001
+                    content = ""
+            if not content:
+                return out
+            # infobox = {{Infobox … }} ka pehla hissa
+            ib = ""
+            m0 = re.search(r"\{\{\s*Infobox[^\n]*", content, re.I)
+            if m0:
+                ib = content[m0.start(): m0.start() + 3000]
+            scope = ib or content[:3000]
+
+            codes: List[str] = []
+            for m in re.finditer(r"\b([A-Z]{1,5}-[A-Z0-9]{3,}(?:[/|-][A-Z0-9]+)*)\b", scope):
+                c = m.group(1).strip()
+                if any(ch.isdigit() for ch in c) and not re.match(r"^[A-Z]{2,4}-?\d{4}$", c):
+                    if c not in codes:
+                        codes.append(c)
+            for field in ("models", "modelname", "model_name", "modelnumber"):
+                m = re.search(r"\|\s*" + field + r"\s*=([^\n|]{4,220})", scope, re.I)
+                if m:
+                    for c in re.findall(r"[A-Z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+", m.group(1)):
+                        if len(c) >= 5 and any(ch.isdigit() for ch in c) and c not in codes:
+                            codes.append(c)
+            if codes:
+                out["model_codes"] = codes[:10]
+
+            m2 = re.search(r"\|\s*released\s*=\s*([^\n|]{4,200})", content, re.I)
+            if m2:
+                raw = m2.group(1)
+                years = re.findall(r"(?:19|20)\d{2}", re.sub(r"\{\{[^}]*\}\}", " ", raw))
+                if years:
+                    out["released"] = years[0]
+
+            img = re.search(r"\|\s*image\s*=\s*([^\n|]{3,120})", content, re.I)
+            if img:
+                fname = img.group(1).strip()
+                if fname.lower().startswith("http"):
+                    out["image"] = fname
+                else:
+                    r2 = await client.get("https://en.wikipedia.org/w/api.php",
+                                          params={"action": "query", "titles": f"File:{fname}",
+                                                  "prop": "imageinfo", "iiprop": "url", "format": "json"})
+                    if r2.status_code == 200:
+                        for _p, pg in ((r2.json().get("query") or {}).get("pages") or {}).items():
+                            try:
+                                out["image"] = pg["imageinfo"][0]["url"]
+                            except Exception:  # noqa: BLE001
+                                pass
+    except Exception:  # noqa: BLE001
+        return out
+    _WIKI_CACHE[key] = dict(out)
+    return out
+
+
+async def native_device_specs(params: Dict[str, Any], request: Request) -> Tuple[Optional[Dict], bool]:
+    model = (params.get("model") or params.get("device") or params.get("q") or "").strip()
+    if not model:
+        return None, True
+    out = await _device_specs_fetch(model, (params.get("brand") or "").strip())
+    if not out:
+        return {"success": False, "model": model,
+                "error": "Is device ke specs nahi mile — naam thoda saaf likho (jaise 'Samsung Galaxy Tab A9+')."}, True
+    return out, False
+
+
 async def native_imei(params: Dict[str, Any], request: Request) -> Tuple[Optional[Dict], bool]:
     """TAC-only lookup: device serial/check digit are never needed or returned."""
     raw = clean_number(params.get("tac") or params.get("imei") or params.get("q") or "")
@@ -944,19 +1265,85 @@ async def native_imei(params: Dict[str, Any], request: Request) -> Tuple[Optiona
         return {"success": False, "tac": raw,
                 "error": "8-digit TAC chahiye (IMEI ke pehle 8 digits)."}, True
     tac = raw[:8]
-    brand, model = TAC_HINTS.get(tac, TAC_HINTS.get(tac[:6], TAC_HINTS.get(tac[:4], (None, None))))
     body = REPORTING_BODIES.get(tac[:2], "Unknown / not in local table")
-    known = bool(brand or model)
-    result = {
+
+    # 1) admin ke apne records (custom DB, category=tac)
+    own = custom_lookup("tac", tac)
+    brand = model = device = extra = ""
+    source = ""
+    if own:
+        rec = own[0]
+        brand = str(rec.get("brand") or "").upper()
+        device = str(rec.get("device") or rec.get("model") or "")
+        source = "custom-db"
+    # 2) 255k TAC database (v2.4)
+    if not device:
+        hit = _tac_lookup(tac)
+        if hit:
+            brand = hit["brand"]
+            device = hit["device"]
+            extra = hit["extra"]
+            source = f"tac-db ({_tac_state.get('count', 0)} rows)"
+    # 3) purana chhota local catalog (fallback)
+    if not device:
+        b2, m2 = TAC_HINTS.get(tac, TAC_HINTS.get(tac[:6], TAC_HINTS.get(tac[:4], (None, None))))
+        if b2 or m2:
+            brand, device, source = (b2 or ""), (m2 or ""), "local-catalog"
+    known = bool(device or brand)
+    device = device or ""
+    model_short = device
+    if brand and device.upper().startswith(brand.upper()):
+        model_short = device[len(brand):].strip()
+
+    result: Dict[str, Any] = {
         "success": known,
         "tac": tac,
-        "brand": brand,
-        "model": model,
+        "brand": brand or None,
+        "model": model_short or None,
+        "device": device or None,
+        "extra": extra or None,
+        "model_codes": _model_codes(device, extra),
         "reporting_body": body,
         "device_match": known,
-        "note": ("TAC local catalog me nahi mila; full device-spec catalog configured nahi hai."
-                 if not known else "Local TAC match. Sirf pehle 8 digits use hue; serial/check digit discard kiye gaye."),
+        "source": source or "none",
+        "note": ("TAC database me nahi mila (naya ya rare device ho sakta hai)."
+                 if not known else "TAC match — sirf pehle 8 digits use hue; serial/check digit discard."),
         "requested_at": datetime.now(IST).isoformat(),
+    }
+
+    # 4) full specs + photo (nanoreview) — param specs=0 se band kar sakte ho
+    if known and str(params.get("specs", "1")).lower() not in ("0", "false", "no"):
+        try:
+            sp = await _device_specs_fetch(device or model_short, brand)
+        except Exception:  # noqa: BLE001
+            sp = None
+        if sp:
+            result["specs"] = {"name": sp["name"], "url": sp["url"], "image": sp["image"],
+                               "sections": sp["sections"], "row_count": sp["row_count"]}
+            result["image"] = sp["image"]
+            result["specs_source"] = sp["source"]
+        # Wikipedia: model codes (SM-X210…) + release year + badi image
+        try:
+            wiki = await _wiki_device_extra(device or model_short)
+        except Exception:  # noqa: BLE001
+            wiki = {}
+        if wiki:
+            if wiki.get("model_codes") and not result.get("model_codes"):
+                result["model_codes"] = wiki["model_codes"]
+            if wiki.get("released"):
+                result["released"] = wiki["released"]
+            if wiki.get("image"):
+                result["image_hd"] = wiki["image"]
+                if not result.get("image"):
+                    result["image"] = wiki["image"]
+            result["wiki_extra"] = True
+
+    q = urllib.parse.quote_plus(device or tac)
+    result["links"] = {
+        "gsmarena": f"https://www.gsmarena.com/res.php3?sSearch={q}",
+        "nanoreview": (result.get("specs", {}) or {}).get("url")
+                      or f"https://nanoreview.net/en/search?q={q}",
+        "imei_info": f"https://www.imei.info/?imei={tac}",
     }
     return result, not known
 
@@ -2780,41 +3167,79 @@ async def _provider_savetube(vid: str, watch: str, mode: str, budget: float) -> 
     return out
 
 
-async def _provider_loaderto(vid: str, watch: str, mode: str, budget: float) -> Dict[str, Any]:
-    """loader.to — format do, phir progress poll karo (link unke CDN par hota hai)."""
+async def _provider_loaderto(vid: str, watch: str, mode: str, budget: float,
+                             quality: str = "") -> Dict[str, Any]:
+    """loader.to — asli HD link (1080p FHD mp4) deta hai, thoda slow (~15-20s) par original quality.
+
+    verified: format=1080 → 1920x1080 h264 mp4 (savenow.to CDN, bina referer download).
+    """
     import asyncio as _aio
     import httpx
     out: Dict[str, Any] = {"links": [], "tried": ["loader.to"], "errors": [], "title": ""}
-    fmt = "mp3" if mode == "audio" else "360"
+    q = str(quality or "").strip().lower().replace("p", "")
+    if q in ("", "best", "high", "max", "hd", "full", "original", "1080"):
+        fmt = "1080"
+    elif q in ("720", "480", "360", "240"):
+        fmt = q
+    else:
+        fmt = "1080"
+    if mode == "audio":
+        fmt = "mp3"
+    tiers = [fmt]
+    if fmt == "1080":                      # 1080 fail ho to 720 try karo
+        tiers.append("720")
     try:
-        async with httpx.AsyncClient(timeout=max(8.0, min(25.0, budget)), follow_redirects=True,
+        async with httpx.AsyncClient(timeout=max(10.0, min(30.0, budget)), follow_redirects=True,
                                      headers={"User-Agent": UA}) as client:
-            r = await client.get("https://loader.to/ajax/download.php",
-                                 params={"format": fmt, "url": watch})
-            if r.status_code != 200:
-                out["errors"].append(f"start HTTP {r.status_code}")
-                return out
-            start = r.json()
-            pid = start.get("id")
-            out["title"] = str(start.get("title") or "")
-            if not pid:
-                out["errors"].append("no id")
-                return out
-            polls = int(max(3, min(10, budget / 3)))
-            for _ in range(polls):
-                await _aio.sleep(3)
-                p = await client.get("https://loader.to/ajax/progress.php", params={"id": pid})
-                if p.status_code != 200:
-                    continue
-                pj = p.json()
-                url = str(pj.get("download_url") or "")
-                if url.startswith("http"):
-                    out["links"].append({
-                        "type": "video" if fmt != "mp3" else "audio",
-                        "provider": "loader.to", "quality": fmt + "p" if fmt != "mp3" else "audio",
-                        "ext": "mp3" if fmt == "mp3" else "mp4", "url": url,
-                    })
+            # ⏱️ v2.4.1: hard deadline (pehle 2 tiers milkar 97s kha jate the!)
+            _end = time.monotonic() + max(9.0, float(budget))
+            for t_i, t_fmt in enumerate(tiers):
+                if t_i and (time.monotonic() + 7) > _end:
                     break
+                try:
+                    r = await client.get("https://loader.to/ajax/download.php",
+                                         params={"format": t_fmt, "url": watch})
+                    if r.status_code != 200:
+                        out["errors"].append(f"{t_fmt}: start HTTP {r.status_code}")
+                        continue
+                    start = r.json()
+                    pid = start.get("id")
+                    if start.get("title") and not out["title"]:
+                        out["title"] = str(start["title"])
+                    if not pid:
+                        out["errors"].append(f"{t_fmt}: no id")
+                        continue
+                    got = ""
+                    # 🐛 progress_url (lto2.affadaffa.com) "Id not found" deta hai —
+                    # progress.php hi asli endpoint hai (verified 3 Oct 2026).
+                    while time.monotonic() < _end:
+                        await _aio.sleep(3)
+                        try:
+                            p = await client.get("https://loader.to/ajax/progress.php",
+                                                 params={"id": pid})
+                            pj = p.json()
+                        except Exception:  # noqa: BLE001
+                            continue
+                        u = str(pj.get("download_url") or "")
+                        if u.startswith("http"):
+                            got = u
+                            break
+                    if not got:
+                        out["errors"].append(f"{t_fmt}: timeout")
+                        continue
+                    out["links"].append({
+                        "type": "audio" if t_fmt == "mp3" else "video",
+                        "provider": "loader.to",
+                        "quality": "audio" if t_fmt == "mp3" else f"{t_fmt}p",
+                        "hd": t_fmt == "1080",
+                        "ext": "mp3" if t_fmt == "mp3" else "mp4",
+                        "url": got,
+                    })
+                    if t_fmt != "1080":
+                        break
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    out["errors"].append(f"{t_fmt}: {str(exc)[:80]}")
     except Exception as exc:  # noqa: BLE001
         out["errors"].append(str(exc)[:100])
     return out
@@ -2933,7 +3358,8 @@ async def native_youtube_download(params: Dict[str, Any], request: Request) -> T
     debug: Dict[str, Any] = {}
     deadline = float(get_setting("max_request_seconds", "50") or 50)
     # Render free plan ~25-30s me request maar deta hai, isliye fallback chain tight rakhi hai
-    hard_deadline = min(deadline, 26.0)
+    # v2.4: bot 75s tak wait karta hai; 1080p mux hone me ~18-25s lagta hai
+    hard_deadline = min(deadline if deadline and deadline > 30 else 55.0, 55.0)
     loop = __import__("asyncio").get_event_loop()
     # Cloud (Render) par yt-dlp aksar block hota hai aur 15-30s barbaad karta hai,
     # isliye pehle fast public APIs try karte hain; yt-dlp last me (sirf agar time bache).
@@ -2990,24 +3416,65 @@ async def native_youtube_download(params: Dict[str, Any], request: Request) -> T
     if not result_holder.get("links"):
         _left = hard_deadline - (time.time() - started)
         if _left > 8:
-            for _pf in (_provider_savetube, _provider_loaderto):
+            # v2.4: VIDEO ke liye loader.to (1080p) PEHLE — savetube sirf 480p deta hai (fallback).
+            # AUDIO ke liye savetube (fast mp3) pehle, phir loader.to.
+            if mode == "audio":
+                _order = [_provider_savetube, _provider_loaderto]
+            else:
+                _order = [_provider_loaderto, _provider_savetube]
+            _collected: List[Dict[str, Any]] = []
+            _ptitle = ""
+            for _pf in _order:
                 _left = hard_deadline - (time.time() - started)
-                if _left < 6:
+                if _left < 8:
                     break
                 try:
+                    _pbudget = (_left - 8.0) if _pf is _provider_loaderto else _left
                     _pout = await loop.run_in_executor(
-                        None, lambda: __import__("asyncio").run(_pf(vid, watch, mode, _left)))
+                        None, lambda: __import__("asyncio").run(
+                            _pf(vid, watch, mode, max(9.0, _pbudget), quality) if _pf is _provider_loaderto
+                            else _pf(vid, watch, mode, _left)))
                 except Exception as _pexc:  # noqa: BLE001
                     debug[_pf.__name__] = {"error": str(_pexc)[:120]}
                     continue
                 debug[_pf.__name__] = {"links": len(_pout.get("links") or []),
                                        "errors": (_pout.get("errors") or [])[:2]}
                 if _pout.get("links"):
-                    result_holder.update({"video_id": vid, "title": _pout.get("title") or "",
-                                          "links": _pout["links"],
-                                          "thumbnail": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"})
+                    if _pout.get("title") and not _ptitle:
+                        _ptitle = str(_pout["title"])
+                    _collected.extend(_pout["links"])
                     sources.append(_pout["tried"][0])
-                    break
+                    # 1080p mil gaya → extra provider try karke time barbaad na karo
+                    if any(l.get("hd") for l in _pout["links"]):
+                        break
+                    if mode == "audio" and any(l.get("type") == "audio" for l in _pout["links"]):
+                        break          # mp3 mil gaya (savetube fast) — loader.to ki zarurat nahi
+                    if mode == "video" and any(l.get("type") == "video" for l in _pout["links"]):
+                        break
+            # v2.4.1: HD mil gaya ho to bhi ek halka 480p backup link rakho
+            # (1080p file >45MB ho sakti hai — Telegram bot limit 50MB; bot fallback use karega)
+            if mode != "audio" and any(l.get("hd") for l in _collected) and \
+                    (hard_deadline - (time.time() - started)) > 9:
+                try:
+                    _bout = await loop.run_in_executor(
+                        None, lambda: __import__("asyncio").run(
+                            _provider_savetube(vid, watch, "video", 9.0)))
+                    for _bl in (_bout.get("links") or []):
+                        if _bl.get("type") == "video":
+                            _bl["backup"] = True
+                            _collected.append(_bl)
+                    if _bout.get("links"):
+                        debug["savetube_backup"] = {"links": len(_bout["links"])}
+                except Exception as _bexc:  # noqa: BLE001
+                    debug["savetube_backup"] = {"error": str(_bexc)[:80]}
+            if _collected:
+                _vl = [l for l in _collected if l.get("type") == "video"]
+                _al = [l for l in _collected if l.get("type") == "audio"]
+                _best = sorted(_vl, key=lambda l: int(str(l.get("quality") or "0").replace("p", "") or 0),
+                               reverse=True)
+                result_holder.update({"video_id": vid, "title": _ptitle or "",
+                                      "links": _best + _al,
+                                      "thumbnail": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"})
     # 2) Invidious (proxied links)
     if not result_holder.get("links") and (hard_deadline - (time.time() - started)) > 8:
         await _try(_invidious_streams, "invidious",
@@ -3047,6 +3514,10 @@ async def native_youtube_download(params: Dict[str, Any], request: Request) -> T
     error = result.get("error") or ""
 
     all_links = (result.get("links") or []) if isinstance(result, dict) else []
+    if mode != "audio":
+        _vv = [l for l in all_links if l.get("type") == "video"]
+        _vv.sort(key=lambda l: int(str(l.get("quality") or "0").replace("p", "") or 0), reverse=True)
+        all_links = _vv + [l for l in all_links if l.get("type") != "video"]
     video_link = next((l for l in all_links if l.get("type") == "video"), None)
     audio_link = next((l for l in all_links if l.get("type") == "audio"), None)
 
@@ -3386,6 +3857,511 @@ async def native_vehicle_report(params: Dict[str, Any], request: Request) -> Tup
     return report, False
 
 
+# =====================================================================
+# v2.5 — INSTAGRAM (native: web_profile_info → DDG snippet fallback)
+# =====================================================================
+_IG_APP_ID = "936619743392459"
+_IG_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+async def _ig_web_profile(username: str) -> Optional[Dict[str, Any]]:
+    """Instagram ka public web_profile_info (login nahi chahiye, par IP rate-limit hota hai)."""
+    import httpx
+    hosts = ("https://www.instagram.com", "https://i.instagram.com")
+    for host in hosts:
+        try:
+            async with httpx.AsyncClient(timeout=15, follow_redirects=True,
+                                         headers={"User-Agent": UA}) as client:
+                r = await client.get(f"{host}/api/v1/users/web_profile_info/",
+                                     params={"username": username},
+                                     headers={"x-ig-app-id": _IG_APP_ID, "Accept": "*/*",
+                                              "Referer": f"https://www.instagram.com/{username}/"})
+                if r.status_code != 200:
+                    continue
+                data = r.json().get("data") or {}
+                user = data.get("user") or {}
+                if user.get("username"):
+                    return user
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+async def _ig_ddg(username: str, _q: str = "") -> Dict[str, Any]:
+    """DDG search se public profile summary (followers/following/posts + bio) — keyless fallback."""
+    import httpx
+    out: Dict[str, Any] = {}
+    try:
+        async with httpx.AsyncClient(timeout=18, follow_redirects=True,
+                                     headers={"User-Agent": UA}) as client:
+            r = await client.get("https://html.duckduckgo.com/html/",
+                                 params={"q": (_q or f'site:instagram.com "{username}"')})
+            txt = r.text
+    except Exception:  # noqa: BLE001
+        return out
+
+    def _block(marker: str) -> str:
+        i = txt.find(marker)
+        if i < 0:
+            return ""
+        a = txt.find(">", i)
+        b = txt.find("</a>", a)
+        if a < 0 or b < 0:
+            return ""
+        return _clean_html(txt[a + 1:b])
+
+    def _num_before(text: str, word: str) -> str:
+        i = text.find(word)
+        if i < 0:
+            return ""
+        j = i
+        while j > 0 and (text[j - 1].isdigit() or text[j - 1] in ".," or text[j - 1] in "KMBkmb"):
+            j -= 1
+        val = text[j:i].strip(" .,")
+        return val if val and val[0].isdigit() else ""
+
+    t_clean = _block("result__a")
+    s_clean = _block("result__snippet")
+
+    if t_clean:
+        k = t_clean.find("(@")
+        if k > 0:
+            out["full_name"] = t_clean[:k].strip()[:60]
+            e = t_clean.find(")", k)
+            handle = t_clean[k + 2:e] if e > k else ""
+            if handle:
+                out["username"] = handle.strip()
+    if s_clean:
+        f1 = _num_before(s_clean, "Followers")
+        f2 = _num_before(s_clean, "Following")
+        f3 = _num_before(s_clean, "Posts")
+        if f1:
+            out["followers"] = f1
+        if f2:
+            out["following"] = f2
+        if f3:
+            out["posts"] = f3
+        bio = s_clean
+        k2 = bio.find("on Instagram:")
+        if k2 >= 0:
+            bio = bio[k2 + len("on Instagram:"):]
+        else:
+            k3 = bio.find("Followers")
+            if k3 >= 0:
+                bio = bio[k3 + len("Followers"):]
+                bio = bio.lstrip(" -–—")
+        out["bio"] = bio.strip()[:160]
+    return out
+
+
+async def _ig_og(username: str) -> Dict[str, Any]:
+    """Profile page ke OG meta tags (bot UA se) — followers/bio/photo keyless."""
+    import httpx
+    out: Dict[str, Any] = {}
+    uas = ("Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+           "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+           UA)
+    for ua in uas:
+        try:
+            async with httpx.AsyncClient(timeout=15, follow_redirects=True,
+                                         headers={"User-Agent": ua, "Accept-Language": "en-US,en;q=0.9"}) as client:
+                r = await client.get(f"https://www.instagram.com/{username}/")
+                if r.status_code != 200 or len(r.text) < 500:
+                    continue
+                h = r.text
+
+                def _meta(prop: str) -> str:
+                    key = f'property="{prop}" content="'
+                    i = h.find(key)
+                    if i < 0:
+                        key2 = 'content="' 
+                        j = h.find(f'property="{prop}"')
+                        if j < 0:
+                            return ""
+                        k = h.find(key2, j)
+                        if k < 0 or k - j > 80:
+                            return ""
+                        e = h.find('"', k + len(key2))
+                        return h[k + len(key2):e] if e > 0 else ""
+                    e = h.find('"', i + len(key))
+                    return h[i + len(key):e] if e > 0 else ""
+
+                desc = _meta("og:description")
+                title = _meta("og:title")
+                img = _meta("og:image")
+                if title:
+                    out["full_name"] = title.replace("(@%s)" % username, "").replace("• Instagram photos and videos", "").strip(" -•")[:60]
+                if img:
+                    out["profile_pic"] = img
+                if desc:
+                    out["_desc"] = desc[:250]
+                if out:
+                    return out
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def _ig_parse_desc(desc: str, out: Dict[str, Any]) -> None:
+    """'680M Followers, 649 Following, 4,138 Posts - ... Instagram' → numbers + bio (regex-free)."""
+    d = desc or ""
+    for word, key in (("Followers", "followers"), ("Following", "following"), ("Posts", "posts")):
+        i = d.find(word)
+        if i < 0:
+            continue
+        j = i
+        while j > 0 and (d[j - 1].isdigit() or d[j - 1] in ".," or d[j - 1] in "KMBkmb"):
+            j -= 1
+        val = d[j:i].strip(" .,")
+        if val and val[0].isdigit():
+            out[key] = val
+    bio = d
+    for marker in ("See Instagram photos and videos from", "on Instagram:", "Instagram:"):
+        k = bio.find(marker)
+        if k >= 0:
+            bio = bio[k + len(marker):]
+            break
+    bio = bio.strip(" -–—•\"'")
+    if bio:
+        out["bio"] = bio[:160]
+
+
+async def native_instagram_profile(params: Dict[str, Any], request: Request) -> Tuple[Optional[Dict], bool]:
+    """Instagram public profile — 3-layer chain: API → OG meta → search index (kabhi error nahi)."""
+    user = re.sub(r"[^A-Za-z0-9._]", "", str(
+        params.get("username") or params.get("user") or params.get("q") or "").lstrip("@"))
+    if not user:
+        return None, True
+    if user.lower() in _IG_CACHE:
+        return dict(_IG_CACHE[user.lower()]), False
+
+    profile_url = f"https://www.instagram.com/{user}/"
+
+    # 1) official-ish web API
+    node = await _ig_web_profile(user)
+    if node:
+        result: Dict[str, Any] = {
+            "success": True, "username": node.get("username") or user,
+            "full_name": node.get("full_name") or "",
+            "biography": node.get("biography") or "",
+            "followers": (node.get("edge_followed_by") or {}).get("count"),
+            "following": (node.get("edge_follow") or {}).get("count"),
+            "posts": (node.get("edge_owner_to_timeline_media") or {}).get("count"),
+            "verified": bool(node.get("is_verified")),
+            "private": bool(node.get("is_private")),
+            "business": bool(node.get("is_business_account")),
+            "category": node.get("category_name") or "",
+            "profile_pic": node.get("profile_pic_url_hd") or node.get("profile_pic_url") or "",
+            "external_url": node.get("external_url") or "",
+            "user_id": str(node.get("id") or ""),
+            "profile_url": profile_url,
+            "source": "instagram (web_profile_info)",
+        }
+        _IG_CACHE[user.lower()] = dict(result)
+        return result, False
+
+    # 2) OG meta tags (bot UA)
+    og = await _ig_og(user)
+    if og:
+        res2: Dict[str, Any] = {"success": True, "partial": True, "username": user,
+                                "profile_url": profile_url,
+                                "full_name": og.get("full_name") or "",
+                                "profile_pic": og.get("profile_pic") or "",
+                                "source": "instagram (public meta tags)"}
+        if og.get("_desc"):
+            _ig_parse_desc(og["_desc"], res2)
+        res2["note"] = ("Live API ne rate-limit kiya — ye public page metadata hai "
+                        "(counts approx ho sakte hain).")
+        _IG_CACHE[user.lower()] = dict(res2)
+        return res2, False
+
+    # 3) search index (DDG, multi-query)
+    dd: Dict[str, Any] = {}
+    for q in (f"site:instagram.com {user}", f"instagram {user} followers"):
+        try:
+            dd = await _ig_ddg(user, _q=q)
+        except TypeError:
+            dd = await _ig_ddg(user)
+        if dd.get("followers") or dd.get("full_name"):
+            break
+        dd = dd or {}
+    if dd:
+        res3: Dict[str, Any] = {"success": True, "partial": True,
+                                "username": dd.get("username") or user,
+                                "full_name": dd.get("full_name") or "",
+                                "biography": dd.get("bio") or "",
+                                "followers": dd.get("followers") or None,
+                                "following": dd.get("following") or None,
+                                "posts": dd.get("posts") or None,
+                                "profile_pic": "", "profile_url": profile_url,
+                                "source": "search index (partial)",
+                                "note": "Live API blocked tha; ye public search index se hai (approx)."}
+        _IG_CACHE[user.lower()] = dict(res3)
+        return res3, False
+
+    # 4) Sab block → phir bhi kaam ka jawab (link + status), error nahi
+    res4: Dict[str, Any] = {
+        "success": True, "partial": True, "data_limited": True, "username": user,
+        "profile_url": profile_url,
+        "followers": None, "following": None, "posts": None,
+        "source": "instagram",
+        "note": ("Instagram ne is server IP se data block kar diya (rate-limit). "
+                 "Profile link neeche diya hai — app me kholein. 10-15 min baad dobara try karein."),
+        "links": [{"name": "Open in Instagram", "url": profile_url},
+                  {"name": "Search on Google", "url": f"https://www.google.com/search?q=instagram+{user}"}],
+    }
+    _IG_CACHE[user.lower()] = dict(res4)
+    return res4, False
+
+
+async def native_instagram_posts(params: Dict[str, Any], request: Request) -> Tuple[Optional[Dict], bool]:
+    """Instagram ke recent public posts (thumbnail / video + permalink + likes/comments)."""
+    user = re.sub(r"[^A-Za-z0-9._]", "", str(
+        params.get("username") or params.get("user") or params.get("q") or "").lstrip("@"))
+    if not user:
+        return None, True
+    profile_url = f"https://www.instagram.com/{user}/"
+    node = await _ig_web_profile(user)
+    if not node:
+        return {"success": True, "partial": True, "data_limited": True, "username": user,
+                "count": 0, "posts": [], "profile_url": profile_url,
+                "note": ("Instagram ne is server IP se data block kar diya (rate-limit) — "
+                         "posts list abhi nahi mili. Profile link se khud dekh sakte hain."),
+                "links": [{"name": "Open profile", "url": profile_url}]}, False
+    edges = ((node.get("edge_owner_to_timeline_media") or {}).get("edges") or [])
+    items = []
+    for e in edges[:12]:
+        n = e.get("node") or {}
+        cap_edge = ((n.get("edge_media_to_caption") or {}).get("edges") or [{}])
+        caption = ((cap_edge[0] or {}).get("node") or {}).get("text") or ""
+        items.append({
+            "shortcode": n.get("shortcode"),
+            "type": "video" if n.get("is_video") else "image",
+            "caption": caption[:220],
+            "thumbnail": n.get("thumbnail_src") or n.get("display_url") or "",
+            "video_url": n.get("video_url") or "",
+            "likes": (n.get("edge_liked_by") or {}).get("count")
+                     or (n.get("edge_media_preview_like") or {}).get("count") or 0,
+            "comments": (n.get("edge_media_to_comment") or {}).get("count") or 0,
+            "taken_at": n.get("taken_at_timestamp"),
+            "permalink": f"https://www.instagram.com/p/{n.get('shortcode')}/" if n.get("shortcode") else "",
+        })
+    return {"success": True, "username": node.get("username") or user,
+            "full_name": node.get("full_name") or "",
+            "profile_pic": node.get("profile_pic_url_hd") or node.get("profile_pic_url") or "",
+            "count": len(items), "posts": items, "profile_url": profile_url,
+            "source": "instagram (web_profile_info)"}, False
+
+
+# =====================================================================
+# v2.5 — TERABOX (native: share page → share/list API → files + links)
+# =====================================================================
+_TB_CACHE: Dict[str, Dict[str, Any]] = {}
+TB_RESOLVERS = [
+    ("TeraBoxDL", "https://teraboxdl.site/"),
+    ("TeraDL", "https://teradl.com/"),
+    ("WpMedia", "https://www.wpmedia.xyz/terabox"),
+]
+
+
+def _tb_short(url: str) -> str:
+    m = re.search(r"(?:surl=|/s/)([A-Za-z0-9_-]{6,40})", str(url or ""))
+    return m.group(1) if m else ""
+
+
+def _tb_extract(page: str) -> Dict[str, str]:
+    """Share page me se shareid / uk / jsToken nikaalo (mobile UA wale page me hote hain).
+
+    Regex ke bajaye simple find-parsing — koi escaping bug nahi.
+    """
+    out: Dict[str, str] = {}
+
+    def _num_after(key: str, minlen: int = 5) -> str:
+        for q in ('"', "'"):
+            i = page.find(f"{q}{key}{q}")
+            if i < 0:
+                i = page.find(f"{key}{q}")
+            if i < 0:
+                i = page.find(key)
+            if i < 0:
+                continue
+            j = page.find(":", i)
+            if j < 0 or j - i > 40:
+                continue
+            k = j + 1
+            while k < len(page) and page[k] in " \t":
+                k += 1
+            if k < len(page) and page[k] in "\"'":
+                k += 1
+            digits = ""
+            while k < len(page) and page[k].isdigit():
+                digits += page[k]
+                k += 1
+            if len(digits) >= minlen:
+                return digits
+        return ""
+
+    def _token_after(key: str, minlen: int = 10) -> str:
+        i = page.find(key)
+        while i >= 0:
+            j = page.find(":", i)
+            if j < 0 or j - i > 40:
+                i = page.find(key, i + 1)
+                continue
+            k = j + 1
+            while k < len(page) and page[k] in " \t\"'":
+                k += 1
+            tok = ""
+            while k < len(page) and (page[k].isalnum() or page[k] in "_-"):
+                tok += page[k]
+                k += 1
+            if len(tok) >= minlen and not tok.startswith("function"):
+                return tok
+            i = page.find(key, i + 1)
+        return ""
+
+    def _text_after(key: str, maxlen: int = 120) -> str:
+        i = page.find(f'"{key}"')
+        if i < 0:
+            return ""
+        j = page.find(":", i)
+        if j < 0:
+            return ""
+        k = j + 1
+        while k < len(page) and page[k] in " \t":
+            k += 1
+        if k < len(page) and page[k] in "\"'":
+            q = page[k]
+            e = page.find(q, k + 1)
+            if e > k:
+                return page[k + 1:e][:maxlen]
+        return ""
+
+    out["shareid"] = _num_after("shareid", 6)
+    out["uk"] = _num_after("uk", 5)
+    out["jsToken"] = _token_after("jsToken", 10)
+    fn = _text_after("server_filename")
+    if fn:
+        out["filename"] = fn
+    sz = _num_after("size", 4)
+    if sz:
+        out["size"] = sz
+    return out
+
+
+async def native_terabox(params: Dict[str, Any], request: Request) -> Tuple[Optional[Dict], bool]:
+    """TeraBox share link → file list + direct links (ya link dead hone par saaf jawab)."""
+    import httpx
+    url = str(params.get("url") or params.get("link") or params.get("q") or "").strip()
+    surl = _tb_short(url)
+    if not surl:
+        return None, True
+    if surl in _TB_CACHE:
+        return dict(_TB_CACHE[surl]), False
+
+    mob = {"User-Agent": "Mozilla/5.0 (Linux; Android 10; SM-G975F) AppleWebKit/537.36 "
+                         "(KHTML, like Gecko) Chrome/126.0 Mobile Safari/537.36"}
+    result: Dict[str, Any] = {"success": False, "shorturl": surl, "share_url": url}
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers=mob) as client:
+            r = await client.get("https://www.terabox.com/sharing/link", params={"surl": surl})
+            page = r.text
+            info = _tb_extract(page)
+            result.update({k: v for k, v in info.items() if k in ("filename", "size")})
+            files: List[Dict[str, Any]] = []
+            if info.get("shareid"):
+                p = {"app_id": "250528", "web": "1", "channel": "dubox", "clienttype": "0",
+                     "jsToken": info.get("jsToken") or "", "shorturl": surl, "root": "1"}
+                if info.get("uk"):
+                    p["uk"] = info["uk"]
+                rr = await client.get("https://www.terabox.com/share/list", params=p,
+                                      headers={"Referer": str(r.url)})
+                if rr.status_code == 200:
+                    j = rr.json()
+                    result["errno"] = j.get("errno")
+                    for f in (j.get("list") or []):
+                        if not isinstance(f, dict):
+                            continue
+                        size = f.get("size")
+                        try:
+                            size = int(size)
+                        except Exception:  # noqa: BLE001
+                            size = 0
+                        files.append({
+                            "name": f.get("server_filename") or f.get("filename") or "file",
+                            "size_bytes": size,
+                            "size": (f"{round(size / 1048576, 2)} MB" if size else "N/A"),
+                            "isdir": str(f.get("isdir")) == "1",
+                            "path": f.get("path"),
+                            "dlink": f.get("dlink") or f.get("downloadLink") or "",
+                            "fs_id": f.get("fs_id"),
+                        })
+            if files:
+                result.update({"success": True, "count": len(files), "files": files,
+                               "title": files[0].get("name") if len(files) == 1 else
+                                        (result.get("filename") or f"{len(files)} files"),
+                               "provider": "terabox (native)",
+                               "note": "Direct link 2-6 ghante me expire ho jata hai — turant use karein."})
+                _TB_CACHE[surl] = dict(result)
+                return result, False
+            # link dead / files nahi mile → saaf jawab + resolver list (error nahi)
+            result.update({
+                "success": True, "count": 0, "files": [],
+                "title": result.get("filename") or "",
+                "provider": "terabox",
+                "note": ("Is share link par koi file nahi mili — link delete/expire ho gaya hai. "
+                         "Naya link banakar dobara try karein."),
+                "resolvers": [{"name": n, "url": u} for n, u in TB_RESOLVERS],
+            })
+    except Exception as exc:  # noqa: BLE001
+        result.update({"success": True, "count": 0, "files": [], "provider": "terabox",
+                       "note": f"TeraBox server se baat nahi ho payi: {str(exc)[:100]}",
+                       "resolvers": [{"name": n, "url": u} for n, u in TB_RESOLVERS]})
+    _TB_CACHE[surl] = dict(result)
+    return result, False
+
+
+async def native_bgmi(params: Dict[str, Any], request: Request) -> Tuple[Optional[Dict], bool]:
+    """BGMI / PUBG Mobile player info — provider key ho to live, warna saaf jawab + guide.
+
+    Official PUBG API mobile support nahi karta, isliye mobile stats ke liye authorized
+    provider key chahiye. Env me set karo:
+        BGMI_API_URL=https://provider.example/api/player
+        BGMI_API_KEY=xxxxx
+    """
+    user = str(params.get("user") or params.get("id") or params.get("uid")
+               or params.get("player") or params.get("q") or "").strip()
+    if not user:
+        return None, True
+    api_url = (os.environ.get("BGMI_API_URL") or "").strip()
+    api_key = (os.environ.get("BGMI_API_KEY") or "").strip()
+    if api_url:
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=20, follow_redirects=True,
+                                         headers={"User-Agent": UA}) as client:
+                r = await client.get(api_url, params={"id": user, "uid": user, "key": api_key},
+                                     headers={"Authorization": f"Bearer {api_key}"} if api_key else {})
+                if r.status_code == 200:
+                    j = r.json()
+                    if j:
+                        return {"success": True, "player_id": user, "provider": api_url,
+                                "source": "authorized provider", "data": j}, False
+        except Exception:  # noqa: BLE001
+            pass
+    return {
+        "success": True, "available": False, "player_id": user,
+        "note": ("BGMI / PUBG Mobile ka player data official PUBG API me nahi aata (mobile support "
+                 "nahi hai) — iske liye authorized provider key chahiye. Key lagte hi ye endpoint "
+                 "live stats dega."),
+        "how_to_setup": ["BGMI_API_URL=<provider endpoint>", "BGMI_API_KEY=<your key>"],
+        "links": [
+            {"name": "Official BGMI site", "url": "https://www.battlegroundsmobileindia.com/"},
+            {"name": "Official PUBG API (PC/console)", "url": "https://developer.pubg.com/"},
+            {"name": "How to find your in-game ID", "url": "https://www.google.com/search?q=how+to+find+bgmi+character+id"},
+        ],
+    }, False
+
 NATIVE_FUNCS: Dict[str, Callable[..., Awaitable[Tuple[Optional[Dict], bool]]]] = {
     "ip_v1": native_ip_v1,
     "ip_v2": native_ip_v2,
@@ -3412,8 +4388,13 @@ NATIVE_FUNCS: Dict[str, Callable[..., Awaitable[Tuple[Optional[Dict], bool]]]] =
     "pass_check": native_pass_check,
     "aadhaar_family": native_aadhaar_family,
     "youtube_download": native_youtube_download,
+    "device_specs": native_device_specs,
     "snap_stories": native_snap_stories,
     "snap_highlights": native_snap_highlights,
+    "instagram_profile": native_instagram_profile,
+    "instagram_posts": native_instagram_posts,
+    "terabox": native_terabox,
+    "bgmi": native_bgmi,
 }
 for _kind in ("challan", "challan-v2", "challan-v4", "info", "info-v2", "rc", "details", "v"):
     NATIVE_FUNCS[f"vehicle_{_kind.replace('-', '_')}"] = None  # filled after loop (await below)
@@ -3442,8 +4423,12 @@ ENDPOINTS: List[Dict[str, Any]] = [
 
     # ---------- Device ----------
     dict(path="imei", name="IMEI Info", icon="📱", category="Device", native="imei",
-         mode="native", params=[P("imei", "35301011")],
-         desc="Device model hint by TAC (first 8 IMEI digits only). Full serial digits are discarded; no blacklist or owner lookup."),
+         mode="native", timeout=60, params=[P("imei", "356356426587792"), P("specs", "1")],
+         desc="⭐ Full IMEI check: 8-digit TAC se brand + model (255k TAC database) + poori specs + photo "
+              "(nanoreview). Full serial digits discard hote hain; no blacklist/owner lookup. specs=0 se sirf model."),
+    dict(path="device-specs", name="Device Specs", icon="📲", category="Device", native="device_specs",
+         mode="native", timeout=45, params=[P("model", "samsung galaxy tab a9 plus")],
+         desc="Kisi bhi phone/tablet ki full specs + photo (nanoreview.net se) — model naam se."),
 
     # ---------- World ----------
     dict(path="country", name="Country Info", icon="🗺️", category="World", native="country",
@@ -3504,30 +4489,34 @@ ENDPOINTS: List[Dict[str, Any]] = [
     dict(path="snap-highlights", name="Snapchat Highlights", icon="👻", category="Social",
          native="snap_highlights", mode="native", params=[P("username", "priyapanchal272")],
          desc="Snapchat public highlights + spotlight (native parse)."),
-    dict(path="instagram-profile", name="Instagram Profile", icon="📸", category="Social", native=None,
+    dict(path="instagram-profile", name="Instagram Profile", icon="📸", category="Social",
+         native="instagram_profile",
          mode="upstream", params=[P("username", "sumit_sharma2")],
          desc="Instagram profile info (followers, bio, profile picture)."),
-    dict(path="instagram-posts", name="Instagram Posts", icon="📸", category="Social", native=None,
+    dict(path="instagram-posts", name="Instagram Posts", icon="📸", category="Social",
+         native="instagram_posts",
          mode="upstream", params=[P("username", "sumit_sharma2")],
          desc="Recent Instagram posts / media for a username."),
 
     # ---------- File / Cloud ----------
-    dict(path="terabox-file", name="Terabox File", icon="📦", category="Files", native=None,
+    dict(path="terabox-file", name="Terabox File", icon="📦", category="Files", native="terabox",
          mode="upstream", params=[P("url", "https://1024terabox.com/s/1ahJz-qdH7h_9One0lXxDoA")],
          desc="Terabox file metadata from a share link."),
-    dict(path="terabox-stream", name="Terabox Stream", icon="📦", category="Files", native=None,
+    dict(path="terabox-stream", name="Terabox Stream", icon="📦", category="Files", native="terabox",
          mode="upstream", params=[P("url", "https://1024terabox.com/s/1EqwgqWQgmeOvQxc33258UA")],
          desc="Direct streaming / download links for Terabox content."),
-    dict(path="terabox-stream-v2", name="Terabox Stream V2", icon="📦", category="Files", native=None,
+    dict(path="terabox-stream-v2", name="Terabox Stream V2", icon="📦", category="Files",
+         native="terabox",
          mode="upstream", params=[P("url", "https://1024terabox.com/s/1EqwgqWQgmeOvQxc33258UA")],
          desc="Terabox streaming, version 2."),
-    dict(path="terabox-stream-v3", name="Terabox Stream V3", icon="📦", category="Files", native=None,
+    dict(path="terabox-stream-v3", name="Terabox Stream V3", icon="📦", category="Files",
+         native="terabox",
          mode="upstream", params=[P("url", "https://1024terabox.com/s/1EqwgqWQgmeOvQxc33258UA")],
          desc="Terabox streaming, version 3."),
 
     # ---------- Gaming ----------
-    dict(path="bgmi", name="BGMI Info", icon="🎮", category="Gaming", native=None,
-         mode="upstream", params=[P("user", "55622571339")],
+    dict(path="bgmi", name="BGMI Info", icon="🎮", category="Gaming", native="bgmi",
+         mode="merge_native", params=[P("user", "55622571339")],
          desc="BGMI / PUBG Mobile player stats by in-game ID."),
 
     # ---------- AI / Media ----------
@@ -5317,6 +6306,13 @@ async def api_key_info(request: Request, key: str = ""):
         "rate_limit_per_min": int(rec.get("rate_limit") or 0) or int(get_setting("rate_limit_per_min", "120")),
         "server_time_ist": now_ist(),
     }
+
+
+@app.on_event("startup")
+async def _startup_tac_index():
+    """v2.4: TAC database index background me banao (255k rows ~2-4s)."""
+    import threading as _th
+    _th.Thread(target=_build_tac_index, daemon=True).start()
 
 
 @app.get("/health")
