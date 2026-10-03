@@ -43,7 +43,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 # =====================================================================
 # CONFIGURATION  (everything can be changed from the dashboard too)
 # =====================================================================
-APP_VERSION = "2.6.4"
+APP_VERSION = "2.6.5"
 DB_PATH = os.environ.get("DB_PATH", "osint_database.db")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -6047,6 +6047,24 @@ async def admin_upstream_test(request: Request, path: str = "ip-v2", probe: str 
     res = await upstream_self_test(path, probe)
     res["state"] = upstream_key_status()
     return res
+
+
+@app.get("/admin/env/status")
+async def admin_env_status(request: Request):
+    """Render ke env vars service ko mil rahe hain ya nahi — ek call me (sirf set/MISSING, value nahi)."""
+    require_admin(request)
+    names = [
+        "ADMIN_PASSWORD", "MASTER_API_KEY", "GITHUB_BACKUP_REPO", "GITHUB_BACKUP_TOKEN",
+        "GITHUB_BACKUP_MINUTES", "UPSTREAM_BASE", "UPSTREAM_KEY", "UPSTREAM_ENABLED",
+        "VEHICLE_PROVIDER_URL", "VEHICLE_PROVIDER_KEY", "VEHICLE_PROVIDER_PARAM",
+        "NUMINFO_PROVIDER_URL", "NUMINFO_PROVIDER_KEY", "DB_PATH", "PORT", "BRAND_TAG",
+        "UPI_ID", "HIBP_API_KEY", "DEMO_KEY", "PYTHON_VERSION",
+    ]
+    return {"success": True,
+            "env": {n: ("set ✅" if os.environ.get(n) not in (None, "") else "MISSING ❌") for n in names},
+            "note": ("Jo env var yahan MISSING hai wo service ko nahi mila — Render -> Environment me "
+                     "naam bilkul sahi likha hai ya nahi dekho, phir Save karke restart karo."),
+            "version": APP_VERSION}
 
 
 @app.get("/admin/upstream/status")
