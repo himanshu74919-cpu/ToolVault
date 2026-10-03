@@ -43,7 +43,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 # =====================================================================
 # CONFIGURATION  (everything can be changed from the dashboard too)
 # =====================================================================
-APP_VERSION = "2.7.0"
+APP_VERSION = "2.8.0"
 DB_PATH = os.environ.get("DB_PATH", "osint_database.db")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -2246,6 +2246,8 @@ def _provider_cfg(prefix: str) -> Dict[str, str]:
         # POST body template: {"vehicle_number":"{number}"}  — {number} aur {key} replace honge
         "body": g("BODY"),
         "path": g("PATH"),
+        # v2.8.0: query me key ka naam (numverify: "access_key", baaki: "key")
+        "keyparam": g("KEY_PARAM", "key") or "key",
     }
 
 
@@ -2255,6 +2257,59 @@ def vehicle_provider() -> Dict[str, str]:
 
 def numinfo_provider() -> Dict[str, str]:
     return _provider_cfg("NUMINFO_PROVIDER")
+
+
+def gst_provider() -> Dict[str, str]:
+    """FREE GST lookups: gstinapi.in (100 free/month, no credit card, x-api-key header)."""
+    cfg = _provider_cfg("GST_PROVIDER")
+    if not cfg.get("url"):
+        cfg["url"] = "https://gstinapi.in"
+    if not cfg.get("path"):
+        cfg["path"] = "v1/gstin/{number}"
+    if not cfg.get("keyparam"):
+        cfg["keyparam"] = "x-api-key"
+    if not (os.environ.get("GST_PROVIDER_AUTH") or "").strip():
+        cfg["auth"] = "header"
+    if not (os.environ.get("GST_PROVIDER_HEADER") or "").strip():
+        cfg["header"] = "x-api-key"
+    return cfg
+
+
+async def gst_provider_lookup(gstin: str) -> Optional[Dict[str, Any]]:
+    """gstinapi.in se live GST data (legal name, status, address). Key na ho to None."""
+    cfg = gst_provider()
+    if not cfg.get("key"):
+        return None
+    try:
+        raw = await call_provider(cfg, gstin, timeout=20)
+    except Exception:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    d = raw.get("data") if isinstance(raw.get("data"), dict) else raw
+    out = {
+        "gstin": _first(_dig(d, "gstin", "gstin_number"), gstin) or gstin,
+        "legal_name": _dig(d, "legal_name", "legalname", "trade_name", "name"),
+        "trade_name": _dig(d, "trade_name", "tradename"),
+        "gst_status": _dig(d, "status", "gst_status", "registration_status"),
+        "taxpayer_type": _dig(d, "taxpayer_type", "taxpayertype", "dealer_type"),
+        "business_constitution": _dig(d, "business_constitution", "constitution"),
+        "registration_date": _dig(d, "registration_date", "date_of_registration"),
+        "cancellation_date": _dig(d, "cancellation_date", "date_of_cancellation"),
+        "address": _dig(d, "address", "registered_address", "principal_place_of_business"),
+        "pincode": _dig(d, "pincode", "pin_code"),
+        "state": _dig(d, "state_jurisdiction", "state", "state_name"),
+        "nature_of_business": _dig(d, "nature_of_business", "business_nature"),
+        "source": "gstinapi.in (official GSP network)",
+    }
+    return {k: v for k, v in out.items() if v not in (None, "", [], {})} or None
+
+
+def numinfo_provider_hint() -> str:
+    """Carrier lookup ke liye free option ka hint."""
+    return ("FREE carrier data ke liye: numverify.com se free key lo (100/month, no card) aur "
+            "NUMINFO_PROVIDER_URL=https://apilayer.net/api/validate | NUMINFO_PROVIDER_KEY=<key> | "
+            "NUMINFO_PROVIDER_AUTH=query | NUMINFO_PROVIDER_KEY_PARAM=access_key lagao")
 
 
 def _provider_headers(cfg: Dict[str, str]) -> Dict[str, str]:
@@ -2471,10 +2526,14 @@ async def call_provider(cfg: Dict[str, str], number: str, timeout: float = 25.0)
     url = (cfg.get("url") or "").rstrip("/")
     path = (cfg.get("path") or "").strip()
     if path:
-        url = url + "/" + path.lstrip("/")
+        path = path.replace("{number}", number).replace("{key}", cfg.get("key") or "")
+        if "{number}" in (cfg.get("path") or ""):
+            url = url.rstrip("/") + "/" + path.lstrip("/")     # poora path template
+        else:
+            url = url + "/" + path.lstrip("/")
     params = {cfg["param"]: number}
     if cfg.get("key") and (cfg.get("auth") or "") == "query":
-        params["key"] = cfg["key"]
+        params[cfg.get("keyparam") or "key"] = cfg["key"]
     hdrs = {"User-Agent": UA, **_provider_headers(cfg)}
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         if (cfg.get("method") or "GET").upper() == "POST":
@@ -2740,6 +2799,16 @@ async def native_gst_search(params: Dict[str, Any], request: Request) -> Tuple[O
         # maybe user typed a trade name -> return guidance
         return {"query": gstin, "local_analysis": True,
                 "note": "Not a valid GSTIN format. Upstream search by name may still work."}, True
+    # v2.8.0: aapki FREE GST key (GST_PROVIDER_KEY) lagi ho to LIVE data pehle
+    live = await gst_provider_lookup(gstin)
+    if live:
+        out = dict(parsed)
+        out.update({k: v for k, v in live.items() if k != "gstin"})
+        out["live"] = True
+        out["note"] = "Live data (official GSP network) + offline parser."
+        return out, True
+    parsed["provider_hint"] = ("Live company naam/address chahiye? FREE key lo: gstinapi.in "
+                              "(100 lookups/month, koi credit card nahi) aur GST_PROVIDER_KEY lagao.")
     return parsed, True
 
 
@@ -7290,8 +7359,11 @@ def _action_list() -> List[str]:
         todo.append("SETTING_UPSTREAM_KEY lagao — abhi upstream key invalid hai (GST/PAN live data nahi)")
     if not vehicle_provider().get("url"):
         todo.append("VEHICLE_PROVIDER_URL + KEY lagao — vehicle/challan live data chalu ho jayega")
-    if not numinfo_provider().get("url"):
-        todo.append("NUMINFO_PROVIDER_URL + KEY lagao — number carrier (operator/circle) live data")
+    if not (numinfo_provider().get("url") and numinfo_provider().get("key")):
+        todo.append("FREE carrier data: numverify.com se key lo (100/month, no card) -> NUMINFO_PROVIDER_URL/"
+                    "KEY/AUTH=query/KEY_PARAM=access_key")
+    if not gst_provider().get("key"):
+        todo.append("FREE live GST: gstinapi.in se key lo (100/month, no card) -> GST_PROVIDER_KEY lagao")
     return todo
 
 
@@ -7309,8 +7381,11 @@ async def health():
     return {"status": "ok", "time_ist": now_ist(), "version": APP_VERSION,
             "endpoints": len(ENDPOINTS), "database": os.path.abspath(DB_PATH),
             "providers": {
-                "vehicle": "on" if _vp.get("url") else "off (VEHICLE_PROVIDER_URL set karo)",
-                "carrier": "on" if _np.get("url") else "off (NUMINFO_PROVIDER_URL set karo)",
+                "vehicle": "on" if (_vp.get("url") and _vp.get("key")) else (
+                    "off (paid/free-tier API chahiye; official VAHAN+eChallan links bot me hain)"),
+                "carrier": "on" if (_np.get("url") and _np.get("key")) else numinfo_provider_hint(),
+                "gst": ("on (live)" if gst_provider().get("key")
+                        else "off (FREE key lo: gstinapi.in — 100 lookups/month, no credit card)"),
             },
             "upstream": upstream_key_status(),
             "persistence": {
