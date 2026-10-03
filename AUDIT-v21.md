@@ -113,3 +113,31 @@ daalna — baaki poora code taiyar hai (native parsers already likhe hue hain).
 3. **Test:** `/api/snap-stories?key=Demo&username=priyapanchal272` kholo → 200 + subscribers/story aana chahiye.
 4. **Upstream:** `upstream_key` abhi `Demo` hai jo purane upstream (`osint-apis-hub`) par 401 deta hai — isliye
    terabox/instagram/bgmi/youtube-download 502 hain. Koi working provider key mile to Dashboard → Settings me daal do.
+
+
+---
+
+## 🔧 v2.2 UPDATE — YouTube download ka ASLI ilaaj (2 bugs! )
+
+`/api/youtube-download`, `/api/ytdl`, `/api/youtube-mp3` — teeno 502 de rahe the. Wajah bug thi, YouTube nahi:
+
+1. **`_YT_STATE` kabhi define hi nahi hua tha** → jab bhi yt-dlp wala hissa chalta, `NameError` aata tha
+   aur endpoint 502 de deta. (Ab define kar diya.)
+2. **yt-dlp ke galat player_client** — code me hardcoded list thi
+   `["tv_embedded","web_safari","mweb","web"]` → yt-dlp `No video formats found!` deta hai.
+   Sahi clients (`default` / `android_vr` / `android`) se **1-3 second me** kaam ho jata hai.
+3. **Ordering ulti thi** — pehle Invidious/Piped (dead instances, 13-19s barbaad) try hote the,
+   yt-dlp ko time hi nahi milta tha. Ab **yt-dlp pehle**, phir Invidious/Piped fallback.
+
+### Naya: `/api/ydl/stream` — download proxy
+YouTube ke direct links **IP-locked** hote hain (dusre server se download karo to 403). Isliye ab
+`youtube-download` response me har link ke saath **`proxy_url`** aata hai — us se **kisi bhi device/IP**
+se download chalta hai (Range requests supported, sirf YouTube hosts allow — SSRF-safe).
+
+Live test (local):
+```
+/api/youtube-download?url=https://youtu.be/jNQXAC9IVRw  → success, video 720p mp4 + audio, yt-dlp 1-3s
+proxy stream                                                → HTTP 200, video/mp4, 223 KB
+Range: bytes=0-999                                          → HTTP 206, correct content-range
+bahar ka URL proxy me                                        → 400 blocked (sirf googlevideo/ytimg)
+```

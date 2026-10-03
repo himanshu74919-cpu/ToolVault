@@ -41,7 +41,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 # =====================================================================
 # CONFIGURATION  (everything can be changed from the dashboard too)
 # =====================================================================
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 DB_PATH = os.environ.get("DB_PATH", "osint_database.db")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -2717,6 +2717,11 @@ def _invidious_streams(vid: str, mode: str, quality: str = "", tries: int = 3,
     return {"links": [], "tried": tried, "errors": errors}
 
 
+# 🐛 v2.2 FIX: ye dict pehle code me USE hoti thi par DEFINE kabhi nahi hui thi
+# (_YT_STATE["ytdlp_fail_until"] → NameError → /youtube-download 502). Ab define hai.
+_YT_STATE: Dict[str, float] = {"ytdlp_fail_until": 0.0}
+
+
 def _yt_extract(url: str, mode: str, quality: str, timeout: int = 40) -> Dict[str, Any]:
     """Blocking yt-dlp extraction (run inside a thread)."""
     try:
@@ -2727,29 +2732,43 @@ def _yt_extract(url: str, mode: str, quality: str, timeout: int = 40) -> Dict[st
     if mode == "audio":
         fmt = "bestaudio[ext=m4a]/bestaudio/best"
     elif quality and quality.isdigit():
-        fmt = (f"bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/"
-               f"best[height<={quality}][ext=mp4]/best[ext=mp4]/best")
+        fmt = (f"bv*[height<={quality}]+ba/b[height<={quality}]/b")
     else:
-        fmt = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+        fmt = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b"
 
-    # Cloud/datacenter IP se YouTube aksar "Sign in to confirm you're not a bot" deta hai.
-    # Alag-alag player clients try karne se kai baar bypass ho jata hai.
-    opts = {
+    # 🔧 v2.2 FIX: pehle yahan hardcoded player_client list thi
+    # ["tv_embedded","web_safari","mweb","web"] — wo list yt-dlp me
+    # "No video formats found!" deti hai. Ab kaam karne wale clients
+    # (android_vr, android) + default order me try hote hain (har try ~1s).
+    base_opts = {
         "quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
         "format": fmt, "socket_timeout": timeout, "nocheckcertificate": True,
-        "source_address": None, "geo_bypass": True,
-        "extractor_args": {"youtube": {"player_client": ["tv_embedded", "web_safari", "mweb", "web"]}},
+        "source_address": None, "geo_bypass": True, "retries": 2, "fragment_retries": 2,
         "http_headers": {
             "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                           "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"),
+                           "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"),
             "Accept-Language": "en-US,en;q=0.9",
         },
     }
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except Exception as exc:
-        return {"error": str(exc)[:300]}
+    ytdlp_errs = []
+    info = None
+    # default clients sabse zyada formats dete hain (24 tk), phir android_vr/android
+    # (combined single file — kam quality par hamesha chalta hai)
+    for clients in ([], ["android_vr"], ["android"], ["web"], ["ios"]):
+        opts = dict(base_opts)
+        if clients:
+            opts["extractor_args"] = {"youtube": {"player_client": clients}}
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            if info and (info.get("formats") or info.get("url")):
+                break
+            info = None
+        except Exception as exc:
+            ytdlp_errs.append(f"{'/'.join(clients) or 'default'}: {str(exc)[:90]}")
+            info = None
+    if info is None:
+        return {"error": "yt-dlp: " + (" | ".join(ytdlp_errs[-2:]) or "no formats found")}
 
     links: List[Dict[str, Any]] = []
     requested = info.get("requested_formats") or []
@@ -2832,17 +2851,9 @@ async def native_youtube_download(params: Dict[str, Any], request: Request) -> T
 
     result_holder: Dict[str, Any] = {}
 
-    # 1) Invidious (proxied links — kisi bhi device se chalte hain)
-    await _try(_invidious_streams, "invidious",
-               {"vid": vid, "mode": "audio" if mode == "audio" else mode,
-                "quality": quality, "tries": 3, "per_timeout": 7.0})
-    # 2) Piped
-    if not result_holder.get("links"):
-        await _try(_piped_streams, "piped",
-                   {"vid": vid, "mode": "audio" if mode == "audio" else mode,
-                    "quality": quality, "tries": 2, "per_timeout": 6.0})
-    # 3) yt-dlp (local/yahan block na ho to best quality)
-    if not result_holder.get("links") and (hard_deadline - (time.time() - started)) > 14:
+    # 🔧 v2.2 FIX: pehle Invidious/Piped (dead instances) 13-19s kha jate the aur
+    # yt-dlp ko mauka hi nahi milta tha. Ab yt-dlp PEHLE (fix hone ke baad ~1-3s).
+    if (hard_deadline - (time.time() - started)) > 5:
         ytdlp_skipped = time.time() < _YT_STATE["ytdlp_fail_until"]
         if ytdlp_skipped:
             debug["yt_dlp"] = {"links": 0, "error": None, "skipped_recent_failure": True}
@@ -2850,7 +2861,7 @@ async def native_youtube_download(params: Dict[str, Any], request: Request) -> T
             try:
                 out = await loop.run_in_executor(
                     None, lambda: _yt_extract(watch, "audio" if mode == "audio" else mode,
-                                              quality, timeout=int(min(20, hard_deadline - (time.time() - started) - 4))))
+                                              quality, timeout=int(min(25, max(8, hard_deadline - (time.time() - started) - 4)))))
             except Exception as exc:  # noqa: BLE001
                 out = {"error": str(exc)[:200]}
             ytdlp_err = out.get("error")
@@ -2860,7 +2871,17 @@ async def native_youtube_download(params: Dict[str, Any], request: Request) -> T
                 result_holder.update(out)
                 sources.append("yt-dlp")
             elif ytdlp_err:
-                _YT_STATE["ytdlp_fail_until"] = time.time() + 900
+                _YT_STATE["ytdlp_fail_until"] = time.time() + 300
+    # 2) Invidious (proxied links)
+    if not result_holder.get("links") and (hard_deadline - (time.time() - started)) > 8:
+        await _try(_invidious_streams, "invidious",
+                   {"vid": vid, "mode": "audio" if mode == "audio" else mode,
+                    "quality": quality, "tries": 2, "per_timeout": 6.0})
+    # 3) Piped
+    if not result_holder.get("links") and (hard_deadline - (time.time() - started)) > 6:
+        await _try(_piped_streams, "piped",
+                   {"vid": vid, "mode": "audio" if mode == "audio" else mode,
+                    "quality": quality, "tries": 2, "per_timeout": 5.0})
     # 4) upstream YouTube metadata/links (aakhri koshish)
     if not result_holder.get("links") and (time.time() - started) < hard_deadline * 0.9:
         up, _ = await upstream_call("youtube-all", {"url": watch},
@@ -2919,6 +2940,17 @@ async def native_youtube_download(params: Dict[str, Any], request: Request) -> T
     lines.append("")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
+    # v2.2: proxy links — googlevideo direct links IP-locked hote hain, ye kisi bhi
+    # device/IP se chalte hain (hub ke through stream hota hai).
+    try:
+        _base = str(request.base_url).rstrip("/")
+        for l in all_links:
+            if l.get("url"):
+                l["proxy_url"] = (f"{_base}/api/ydl/stream?key={DEMO_KEY}"
+                                  f"&url={urllib.parse.quote(str(l['url']), safe='')}")
+    except Exception:
+        pass
+
     return {
         "success": bool(all_links),
         "video_id": vid,
@@ -2931,6 +2963,8 @@ async def native_youtube_download(params: Dict[str, Any], request: Request) -> T
         "links": all_links,
         "download_url": (video_link or audio_link or {}).get("url"),
         "audio_url": (audio_link or {}).get("url"),
+        "proxy_download_url": (video_link or audio_link or {}).get("proxy_url"),
+        "proxy_audio_url": (audio_link or {}).get("proxy_url"),
         "error": error or (result.get("error") if isinstance(result, dict) else None),
         "sources_used": sources or ["none"],
         "response_time": f"{round(time.time() - started, 2)}s",
@@ -3636,6 +3670,68 @@ def over_rate_limit(api_key: str, per_key_limit: int = 0) -> bool:
         row = conn.execute(
             "SELECT COUNT(*) AS c FROM request_logs WHERE api_key=? AND ts>=?", (api_key, cutoff)).fetchone()
     return int(row["c"]) > limit
+
+
+# ---------------------------------------------------------------------
+# ydl stream proxy (v2.2) — googlevideo links IP-locked hote hain, isliye
+# hub se hi stream/forward karte hain. Sirf YouTube hosts allowed (SSRF-safe).
+# ---------------------------------------------------------------------
+YDL_ALLOWED_HOSTS = ("googlevideo.com", "ytimg.com", "googleusercontent.com", "ggpht.com")
+
+
+@app.get("/api/ydl/stream")
+async def ydl_stream(request: Request, url: str = "", key: str = ""):
+    """YouTube ke direct links ko hub ke through stream/download karo (Range support)."""
+    api_key = key or request.query_params.get("key", DEMO_KEY)
+    okk, _k, kerr = validate_key(api_key)
+    if not okk:
+        return JSONResponse({"success": False, "error": kerr}, status_code=401)
+    try:
+        from urllib.parse import urlparse as _urlparse
+        host = (_urlparse(url).hostname or "").lower()
+    except Exception:
+        host = ""
+    if not host or not any(host == h or host.endswith("." + h) for h in YDL_ALLOWED_HOSTS):
+        return JSONResponse({
+            "success": False,
+            "error": "Sirf YouTube (googlevideo) links stream ho sakte hain.",
+            "allowed_hosts": list(YDL_ALLOWED_HOSTS),
+        }, status_code=400)
+
+    import httpx
+    from fastapi.responses import StreamingResponse
+    rng = request.headers.get("range")
+    fwd_headers = {"User-Agent": UA, "Accept": "*/*"}
+    if rng:
+        fwd_headers["Range"] = rng
+
+    async def _iter():
+        client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=120.0), follow_redirects=True)
+        try:
+            async with client.stream("GET", url, headers=fwd_headers) as resp:
+                async for chunk in resp.aiter_bytes(64 * 1024):
+                    yield chunk
+        finally:
+            await client.aclose()
+
+    try:
+        client0 = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+        head = await client0.get(url, headers=fwd_headers)
+        status = head.status_code
+        hdrs = {}
+        for h in ("content-type", "content-length", "content-range", "accept-ranges"):
+            if h in head.headers:
+                hdrs[h] = head.headers[h]
+        await head.aclose()
+        await client0.aclose()
+        if status >= 400:
+            return JSONResponse({"success": False, "error": f"Upstream HTTP {status}",
+                                 "hint": "Link expire ho gaya hoga — dobara /api/youtube-download chalao."},
+                                status_code=502)
+        hdrs["content-disposition"] = 'attachment; filename="youtube_download"'
+        return StreamingResponse(_iter(), status_code=status, headers=hdrs)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"success": False, "error": f"stream error: {str(exc)[:120]}"}, status_code=502)
 
 
 # =====================================================================
