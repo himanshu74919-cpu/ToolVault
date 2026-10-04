@@ -43,7 +43,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 # =====================================================================
 # CONFIGURATION  (everything can be changed from the dashboard too)
 # =====================================================================
-APP_VERSION = "2.8.3"
+APP_VERSION = "2.8.4"
 DB_PATH = os.environ.get("DB_PATH", "osint_database.db")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -8709,6 +8709,59 @@ async def on_startup():
             threading.Thread(target=_auto_backup_loop, name="hub-db-backup", daemon=True).start()
         # v2.6.8: startup par turant backup NAHI (warna naya deploy purane backup ko clobber kar deta hai).
         # Pehla auto-backup 15 min baad hoga; turant chahiye to POST /admin/backup/github.
+
+
+# =====================================================================
+# v2.8.4 — GOV PORTAL (VAHAN / e-Challan / Sarathi / IIB) reachability + safe fetch
+# =====================================================================
+from gov_portal import (  # noqa: E402
+    GOV_SERVICES, open_session, session_fetch, close_session, session_info,
+    probe_all, probe_service,
+)
+
+
+@app.get("/gov/probe")
+async def gov_probe(service: str = ""):
+    """Kya hub ke server se official portals khul rahe hain? (VAHAN/e-Challan/Sarathi/IIB)"""
+    if service:
+        return await probe_service(service)
+    return await probe_all()
+
+
+@app.post("/admin/gov/open")
+async def admin_gov_open(request: Request, payload: Dict[str, Any] = Body(default={})):
+    """Portal ka session kholo (cookies save) — dev/testing ke liye."""
+    require_admin(request)
+    return await open_session(str(payload.get("service") or ""))
+
+
+@app.post("/admin/gov/fetch")
+async def admin_gov_fetch(request: Request, payload: Dict[str, Any] = Body(default={})):
+    """Usi session me path hit karo — sirf parivahan/iib hosts (SSRF-safe)."""
+    require_admin(request)
+    return await session_fetch(str(payload.get("session") or ""),
+                               path=str(payload.get("path") or ""),
+                               method=str(payload.get("method") or "GET"),
+                               data=payload.get("data") or {},
+                               want=str(payload.get("want") or "text"))
+
+
+@app.post("/admin/gov/close")
+async def admin_gov_close(request: Request, payload: Dict[str, Any] = Body(default={})):
+    require_admin(request)
+    return await close_session(str(payload.get("session") or ""))
+
+
+@app.get("/admin/gov/sessions")
+async def admin_gov_sessions(request: Request):
+    require_admin(request)
+    return session_info()
+
+
+@app.get("/gov/services")
+async def gov_services():
+    """Kaunse gov portal support hain + kya karte hain."""
+    return {"ok": True, "services": GOV_SERVICES}
 
 
 if __name__ == "__main__":
