@@ -43,7 +43,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 # =====================================================================
 # CONFIGURATION  (everything can be changed from the dashboard too)
 # =====================================================================
-APP_VERSION = "2.8.5"
+APP_VERSION = "2.8.6"
 DB_PATH = os.environ.get("DB_PATH", "osint_database.db")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -634,8 +634,12 @@ def upstream_key_status() -> Dict[str, Any]:
         "skipped_calls": _UPSTREAM_STATE.get("skips", 0),
         "cooldown_left_sec": max(0, int(float(os.environ.get("UPSTREAM_BAD_COOLDOWN", "900")) - age)) if bad else 0,
         "auto_off": bool(_UPSTREAM_STATE.get("auto_off")),
+        "enabled": get_setting("upstream_enabled", "1") == "1",
         "consecutive_fails": int(_UPSTREAM_STATE.get("fails") or 0),
-        "note": ("upstream OFF: key baar-baar invalid (3 fails) — dashboard Settings me sahi "
+        "note": ("upstream manually OFF hai (dashboard → Settings me upstream_enabled=0) — "
+                 "hub sirf apna native data use kar raha hai, bahar koi query nahi jaati")
+                if get_setting("upstream_enabled", "1") != "1" else
+                ("upstream OFF: key baar-baar invalid (3 fails) — dashboard Settings me sahi "
                  "upstream_key/base daalo, ya demo_key hi rakho (native data chal raha hai)")
                 if _UPSTREAM_STATE.get("auto_off") else
                 ("upstream base set nahi — hub sirf apna native data use kar raha hai "

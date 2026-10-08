@@ -126,3 +126,14 @@ def test_provider_keys_are_saveable_from_dashboard():
         assert f'"{k}"' in post_blk, k
     get_blk = src.split('async def admin_get_settings')[1].split('@app.')[0]
     assert "gst_provider_key" in get_blk and "numinfo_provider_key" in get_blk
+
+
+def test_status_says_manually_off(monkeypatch):
+    monkeypatch.setattr(main, "_UPSTREAM_STATE", {"key_ok": None, "checked_at": 0.0,
+                                                  "error": None, "skips": 0,
+                                                  "fails": 0, "auto_off": False})
+    monkeypatch.setattr(main, "get_setting", lambda k, d="": {"upstream_enabled": "0"}.get(k, d))
+    st = main.upstream_key_status()
+    assert st["enabled"] is False
+    assert "manually OFF" in st["note"]
+    assert "native" in st["note"]
