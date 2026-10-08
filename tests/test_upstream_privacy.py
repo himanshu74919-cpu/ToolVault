@@ -137,3 +137,32 @@ def test_status_says_manually_off(monkeypatch):
     assert st["enabled"] is False
     assert "manually OFF" in st["note"]
     assert "native" in st["note"]
+
+
+def test_settings_save_triggers_backup(monkeypatch):
+    """v2.8.7: dashboard settings ko agle restart tak zinda rakhne ke liye
+    save karte hi GitHub backup jaana chahiye (boot par DB restore hota hai)."""
+    called = []
+    monkeypatch.setattr(main, "BACKUP_REPO", "u/r")
+    monkeypatch.setattr(main, "BACKUP_TOKEN", "t")
+    monkeypatch.setattr(main, "backup_db_to_github",
+                        lambda msg="": (called.append(msg), {"success": True})[1])
+    assert main.persist_backup_now("test") is True
+    import time as _t
+    for _ in range(40):
+        if called:
+            break
+        _t.sleep(0.05)
+    assert called and "settings" in called[0], called
+
+
+def test_backup_helper_silent_without_repo(monkeypatch):
+    monkeypatch.setattr(main, "BACKUP_REPO", "")
+    monkeypatch.setattr(main, "BACKUP_TOKEN", "")
+    assert main.persist_backup_now("test") is False
+
+
+def test_save_endpoint_returns_backup_flag():
+    src_txt = Path(main.__file__).with_name("main.py").read_text(encoding="utf-8")
+    blk = src_txt.split("async def admin_save_settings")[1].split("@app.")[0]
+    assert "persist_backup_now(" in blk and "backup_queued" in blk

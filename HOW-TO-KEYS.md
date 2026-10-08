@@ -18,8 +18,17 @@ hub ke apne dashboard (Settings) se ho jayega.
 | Provider keys sirf **Render environment variables** se padhi jaati thi — aapke paas us service ke Render settings tak pahunch nahi thi, isliye "on nahi kar pa raha" wali halat thi. | Ab **env ke saath-saath dashboard → Settings bhi chalta hai** (`numinfo_provider_key`, `gst_provider_key`, `vehicle_provider_url` …). `/admin/env/status` bhi ab settings-gira hua value "set ✅" dikhata hai. |
 | `/health` ka note adhoora sach likhta tha. | Note ab 4 haalaat alag-alag likhta hai: *manually OFF* / *auto-off (3 fails)* / *base set nahi* / *key invalid* / *ok*. |
 
-Aur hub ke tests: `tests/test_upstream_privacy.py` — 13 naye offline checks
-(poora suite: **20 passed**, koi network call nahi).
+### Settings "gayab" hone ka bug (v2.8.7) — ab theek
+
+Hub **har restart/deploy** par apna DB GitHub ke backup se wapas load karta hai
+(`GITHUB_BACKUP_REPO`, har 15 minute me backup). Isliye dashboard me key save karne ke
+baad 15 minute me backup na jaye to wo setting agle restart par **uda jaati** thi —
+"maine to key daali thi, aaj phir off hai" wali halat. Ab `Settings → Save` karte hi
+foran backup push hota hai (response me `backup_queued: true` aayega). Yaani aapki
+key/setting ab permanent.
+
+Aur hub ke tests: `tests/test_upstream_privacy.py` — 16 offline checks
+(poora suite: **23 passed**, koi network call nahi).
 
 ---
 

@@ -43,7 +43,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 # =====================================================================
 # CONFIGURATION  (everything can be changed from the dashboard too)
 # =====================================================================
-APP_VERSION = "2.8.6"
+APP_VERSION = "2.8.7"
 DB_PATH = os.environ.get("DB_PATH", "osint_database.db")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -236,6 +236,31 @@ if BACKUP_REPO and BACKUP_TOKEN and os.environ.get("GITHUB_BACKUP_RESTORE", "1")
         restore_db_from_github()
     except Exception:
         pass
+
+
+def persist_backup_now(reason: str = "settings update") -> bool:
+    """Dashboard se settings badalte hi DB ka backup GitHub par push karo.
+
+    v2.8.7 (asli bug): Render free instance par restart hoti rehti hai (deploy /
+    idle / auto-deploy) aur upar wali line **har boot** DB ko GitHub ke backup se
+    restore kar deti hai. Isliye dashboard me daali hui key/setting 15 minute
+    (BACKUP_MINUTES) ke andar backup na jaye to **gayab** ho jaati thi — user
+    sochta hai "maine key lagayi thi, aaj phir off hai". Ab save karte hi backup.
+    """
+    if not (BACKUP_REPO and BACKUP_TOKEN):
+        return False
+    import threading as _th
+
+    def _go():
+        try:
+            res = backup_db_to_github(f"settings: {str(reason)[:60]}")
+            if isinstance(res, dict) and not res.get("success"):
+                print(f"⚠️ settings backup skip: {str(res.get('error'))[:120]}")
+        except Exception as e:                                       # noqa: BLE001
+            print(f"⚠️ settings backup fail (koi baat nahi): {str(e)[:120]}")
+
+    _th.Thread(target=_go, daemon=True).start()
+    return True
 
 UA = ("Mozilla/5.0 (Linux; Android 13; SM-X210) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
@@ -6704,7 +6729,10 @@ async def admin_save_settings(request: Request, payload: Dict[str, Any] = Body(d
                  "vehicle_provider_url", "vehicle_provider_key", "vehicle_provider_auth",
                  "vehicle_provider_key_param", "vehicle_provider_param", "vehicle_provider_headers"):
             set_setting(k, str(v))
-    return {"success": True}
+    # v2.8.7: save hote hi backup — warna agle restart par DB purane backup se
+    # restore ho jayegi aur settings gayab (yehi wajah thi ki "key lagayi thi, phir off")
+    queued = persist_backup_now("dashboard settings")
+    return {"success": True, "backup_queued": queued}
 
 
 @app.post("/admin/cache/clear")
