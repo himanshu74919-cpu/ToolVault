@@ -43,13 +43,17 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 # =====================================================================
 # CONFIGURATION  (everything can be changed from the dashboard too)
 # =====================================================================
-APP_VERSION = "2.8.4"
+APP_VERSION = "2.8.5"
 DB_PATH = os.environ.get("DB_PATH", "osint_database.db")
 PORT = int(os.environ.get("PORT", "8000"))
 
 DEFAULT_BRAND = os.environ.get("BRAND_TAG", "@Supermannn_x")
-DEFAULT_UPSTREAM = os.environ.get("UPSTREAM_BASE", "https://osint-apis-hub.onrender.com")
-DEFAULT_UPSTREAM_KEY = os.environ.get("UPSTREAM_KEY", "Demo")
+# v2.8.5: pehle yahan KISI AURE ka demo hub default tha — yaani bina kuch set
+# kiye ye service users ke GSTIN/phone/vehicle numbers us anjaan server par bhej
+# sakti thi (aur wo "Invalid API key" se fail hota tha). Ab default = disabled;
+# upstream sirf tab chalega jab aap khud UPSTREAM_BASE set karo.
+DEFAULT_UPSTREAM = os.environ.get("UPSTREAM_BASE", "").strip()
+DEFAULT_UPSTREAM_KEY = os.environ.get("UPSTREAM_KEY", "").strip()
 DEMO_KEY = os.environ.get("DEMO_KEY", "Demo")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
@@ -203,9 +207,28 @@ def _upstream_key_effective() -> str:
     return (get_setting("upstream_key", DEFAULT_UPSTREAM_KEY) or DEFAULT_UPSTREAM_KEY).strip()
 
 
-def upstream_key_is_placeholder() -> bool:
-    """Demo/khali key = upstream kaam nahi karega (waste call se bacho)."""
-    return _upstream_key_effective() in ("", "Demo", "demo", "KEY")
+_PLACEHOLDER_TOKENS = {"", "demo", "Demo", "key", "KEY", "k", "changeme", "change_me",
+                       "change-me", "test", "testing", "none", "null", "xxx", "your_key",
+                       "yourkey", "api_key", "apikey", "kuchbhi", "koi nahi", "-"}
+
+
+def upstream_key_is_placeholder(key: Optional[str] = None) -> bool:
+    """Asli API key jaisa NA dikhe → upstream ko chhodo (waste call + fail).
+
+    v2.8.5: pehle sirf 3 exact words check hote the, isliye "GST/abc" jaisi
+    7-char typo-key "valid" lagti thi — har request par 45-second timeout ya
+    'Invalid API key' milta tha aur health me 558 skipped calls dikhte the.
+    """
+    k = (key if key is not None else _upstream_key_effective() or "").strip()
+    if k in _PLACEHOLDER_TOKENS or k.lower() in {t.lower() for t in _PLACEHOLDER_TOKENS}:
+        return True
+    if len(k) < 12:                       # asli keys (numverify/gstinapi/rapidapi) itni chhoti nahi
+        return True
+    if "/" in k or " " in k or ":" in k:  # "GST/xxx", "key: 123" jaisa paste-gadbad
+        return True
+    if not re.search(r"[A-Za-z0-9_-]{10,}", k):
+        return True
+    return False
 
 
 if BACKUP_REPO and BACKUP_TOKEN and os.environ.get("GITHUB_BACKUP_RESTORE", "1") != "0":
@@ -610,18 +633,30 @@ def upstream_key_status() -> Dict[str, Any]:
         "checked": (f"{int(age)}s pehle" if _UPSTREAM_STATE.get("checked_at") else None),
         "skipped_calls": _UPSTREAM_STATE.get("skips", 0),
         "cooldown_left_sec": max(0, int(float(os.environ.get("UPSTREAM_BAD_COOLDOWN", "900")) - age)) if bad else 0,
-        "note": ("Upstream key INVALID hai — Render -> Environment me SETTING_UPSTREAM_KEY=apni-asli-key "
-                 "lagao (ya dashboard Settings me). Tab tak hub native data se kaam kar raha hai.")
-                if (bad and not upstream_key_is_placeholder()) else
-                ("key nahi lagi/placeholder — upstream skip ho raha hai (native data use hota hai)"
-                 if upstream_key_is_placeholder() else "ok / unknown"),
+        "auto_off": bool(_UPSTREAM_STATE.get("auto_off")),
+        "consecutive_fails": int(_UPSTREAM_STATE.get("fails") or 0),
+        "note": ("upstream OFF: key baar-baar invalid (3 fails) — dashboard Settings me sahi "
+                 "upstream_key/base daalo, ya demo_key hi rakho (native data chal raha hai)")
+                if _UPSTREAM_STATE.get("auto_off") else
+                ("upstream base set nahi — hub sirf apna native data use kar raha hai "
+                 "(koi anjaan server par query nahi jaati)"
+                 if not (get_setting("upstream_base", DEFAULT_UPSTREAM) or DEFAULT_UPSTREAM).strip() else
+                 ("Upstream key INVALID hai — dashboard Settings me upstream_key daalo. "
+                  "Tab tak hub native data se kaam kar raha hai.")
+                 if (bad and not upstream_key_is_placeholder()) else
+                 ("key nahi lagi/placeholder — upstream skip (native data use hota hai)"
+                  if upstream_key_is_placeholder() else "ok / unknown")),
     }
 
 
 def upstream_available() -> bool:
-    """False = upstream call skip karo (key nahi lagi / invalid / cooldown)."""
+    """False = upstream call skip karo (band / base nahi / key nahi / invalid / cooldown)."""
     if get_setting("upstream_enabled", "1") != "1":
         return False
+    if _UPSTREAM_STATE.get("auto_off"):
+        return False                      # v2.8.5: baar-baar fail = is process me chhodo
+    if not (get_setting("upstream_base", DEFAULT_UPSTREAM) or DEFAULT_UPSTREAM).strip():
+        return False                      # base hi set nahi — kisi anjaan server par nahi bhejenge
     if upstream_key_is_placeholder():
         _UPSTREAM_STATE.update({"key_ok": False,
                                 "error": "upstream key configured nahi hai (Demo placeholder)",
@@ -637,13 +672,21 @@ def upstream_available() -> bool:
 
 
 def _note_upstream_result(data: Any) -> None:
-    """Upstream ke jawab se key ki health update karo."""
+    """Upstream ke jawab se key ki health update karo.
+
+    v2.8.5: 3 baar lagataar 'invalid key' mile to is process me upstream
+    **auto-off** — purane code me har 15 minute (UPSTREAM_BAD_COOLDOWN) baad dobara
+    probe hota rehta tha, jisse free instance jaagta rehta aur health me
+    'skipped_calls' badhta rehta tha.
+    """
     if data is None:
         return
     txt = str(data)[:300].lower()
     if "invalid api key" in txt or "invalid key" in txt or "unauthorized" in txt:
+        _f = int(_UPSTREAM_STATE.get("fails") or 0) + 1
         _UPSTREAM_STATE.update({"key_ok": False, "checked_at": time.time(),
-                                "error": "Invalid API key (upstream)"})
+                                "error": "Invalid API key (upstream)", "fails": _f,
+                                "auto_off": _f >= 3})
     elif not looks_like_upstream_error(data):
         _UPSTREAM_STATE.update({"key_ok": True, "checked_at": time.time(), "error": None})
 
@@ -2259,8 +2302,25 @@ NATIVE_FUNCS_PATCHED = True
 # Hinglish message + official links (jhoothe data kabhi nahi).
 # =====================================================================
 def _provider_cfg(prefix: str) -> Dict[str, str]:
-    """Provider config — simple API, RapidAPI, ya custom headers/POST sab support."""
-    g = lambda n, d="": (os.environ.get(f"{prefix}_{n}") or d).strip()   # noqa: E731
+    """Provider config — simple API, RapidAPI, ya custom headers/POST sab support.
+
+    v2.8.5: Render **env** ke alawa ab hub ke **dashboard → Settings** me bhi ye
+    values daal sakte ho (`numinfo_provider_key`, `gst_provider_key`,
+    `vehicle_provider_url` …). Fayda: Render dashboard kholne ki zaroorat nahi,
+    aur restart ke baad bhi bachi rehti hain (DB me, GitHub backup me).
+    Pehle sirf env padha jaata tha — isliye "mujhe provider on nahi karna aata"
+    wali halat thi.
+    """
+
+    def g(n, d: str = "") -> str:
+        v = (os.environ.get(f"{prefix}_{n}") or "").strip()
+        if not v:
+            try:
+                v = (get_setting(f"{prefix.lower()}_{n.lower()}", "") or "").strip()
+            except Exception:
+                v = ""
+        return v or d
+    
     return {
         "url": g("URL"),
         "key": g("KEY"),
@@ -6223,8 +6283,16 @@ async def admin_env_status(request: Request):
         "NUMINFO_PROVIDER_URL", "NUMINFO_PROVIDER_KEY", "DB_PATH", "PORT", "BRAND_TAG",
         "UPI_ID", "HIBP_API_KEY", "DEMO_KEY", "PYTHON_VERSION",
     ]
+    def _seen(n: str) -> bool:
+        if os.environ.get(n) not in (None, ""):
+            return True
+        try:                                   # v2.8.5: dashboard-setting bhi counts
+            return bool((get_setting(n.lower(), "") or "").strip())
+        except Exception:
+            return False
+
     return {"success": True,
-            "env": {n: ("set ✅" if os.environ.get(n) not in (None, "") else "MISSING ❌") for n in names},
+            "env": {n: ("set ✅" if _seen(n) else "MISSING ❌") for n in names},
             "note": ("Jo env var yahan MISSING hai wo service ko nahi mila — Render -> Environment me "
                      "naam bilkul sahi likha hai ya nahi dekho, phir Save karke restart karo."),
             "version": APP_VERSION}
@@ -6603,7 +6671,14 @@ async def admin_get_settings(request: Request):
             "cache_ttl", "cache_enabled", "rate_limit_per_min", "github_token",
             "max_request_seconds", "brand_tag", "hibp_api_key", "upi_id", "upi_name",
             "telegram_support", "store_title", "store_tagline", "store_plans",
-            "webhook_secret"]
+            "webhook_secret",
+            # v2.8.5: providers bhi dashboard se (Render env ki zaroorat nahi)
+            "numinfo_provider_url", "numinfo_provider_key", "numinfo_provider_auth",
+            "numinfo_provider_key_param", "numinfo_provider_param",
+            "gst_provider_url", "gst_provider_key", "gst_provider_auth",
+            "gst_provider_key_param", "gst_provider_param", "gst_provider_headers",
+            "vehicle_provider_url", "vehicle_provider_key", "vehicle_provider_auth",
+            "vehicle_provider_key_param", "vehicle_provider_param", "vehicle_provider_headers"]
     return {"success": True, "settings": {k: get_setting(k, "") for k in keys}}
 
 
@@ -6616,7 +6691,14 @@ async def admin_save_settings(request: Request, payload: Dict[str, Any] = Body(d
                  "cache_ttl", "cache_enabled", "rate_limit_per_min", "github_token",
                  "max_request_seconds", "brand_tag", "hibp_api_key", "admin_password",
                  "upi_id", "upi_name", "telegram_support", "store_title", "store_tagline",
-                 "store_plans", "webhook_secret"):
+                 "store_plans", "webhook_secret",
+                 # v2.8.5: provider settings (key kisi ko dikhe — sirf masked dashboard me)
+                 "numinfo_provider_url", "numinfo_provider_key", "numinfo_provider_auth",
+                 "numinfo_provider_key_param", "numinfo_provider_param",
+                 "gst_provider_url", "gst_provider_key", "gst_provider_auth",
+                 "gst_provider_key_param", "gst_provider_param", "gst_provider_headers",
+                 "vehicle_provider_url", "vehicle_provider_key", "vehicle_provider_auth",
+                 "vehicle_provider_key_param", "vehicle_provider_param", "vehicle_provider_headers"):
             set_setting(k, str(v))
     return {"success": True}
 
