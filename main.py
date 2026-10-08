@@ -43,7 +43,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 # =====================================================================
 # CONFIGURATION  (everything can be changed from the dashboard too)
 # =====================================================================
-APP_VERSION = "2.8.7"
+APP_VERSION = "2.8.8"
 DB_PATH = os.environ.get("DB_PATH", "osint_database.db")
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -5978,14 +5978,15 @@ async def run_endpoint(request: Request, ep: Dict[str, Any],
             return JSONResponse(error_payload(ep, key_error), status_code=401)
         if path.startswith("vehicle-") or path in {"vehicle-report", "vehicle-full", "rc-info"}:
             message = ("Live vehicle/owner/challan lookup disabled hai jab tak authorized provider configure na ho. "
-                       "Apni licensed API lagao: VEHICLE_PROVIDER_URL + VEHICLE_PROVIDER_KEY (Render env).")
+                       "Apni licensed API lagao: VEHICLE_PROVIDER_URL + VEHICLE_PROVIDER_KEY (Render env ya "
+                       "dashboard → Settings me daal do, dono chalte hain).")
             links = {
                 "vahan": "https://vahan.parivahan.gov.in/nrservices/faces/user/searchstatus.xhtml",
                 "echallan": "https://echallan.parivahan.gov.in/index/accused-challan",
             }
         elif path in {"num-info", "number-info", "num"}:
             message = ("Number info: LEGAL carrier lookup (operator/circle/type/MNP) ke liye apni API lagao — "
-                       "NUMINFO_PROVIDER_URL + NUMINFO_PROVIDER_KEY (Render env). "
+                       "NUMINFO_PROVIDER_URL + NUMINFO_PROVIDER_KEY (Render env ya dashboard → Settings). "
                        "Leaked personal records (naam/pata) jaan-boojh kar supported nahi — wo illegal hai.")
             links = {"mnp_verify": "https://tafcop.dgtelecom.gov.in/", "sanchar_saathi": "https://sancharsaathi.gov.in/"}
         elif path.startswith("aadhaar") or path == "ration":
